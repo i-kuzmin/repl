@@ -1,0 +1,601 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# repl -- wrap a persistent REPL process and expose it over a UNIX socket.
+#
+#   repl kernel irb          # start a server (admin console on stdin/stdout)
+#   echo 'a = [1,2,3]' | repl send
+#
+# Single-file implementation: everything lives in the Repl module so it can be
+# unit tested by `load`ing this file.
+
+require 'fileutils'
+require 'json'
+require 'open3'
+require 'optparse'
+require 'securerandom'
+require 'socket'
+require 'tmpdir'
+
+module Repl
+  VERSION = '1.0.0'
+
+  DEFAULT_IDLE_TIMEOUT = 0.3   # silence that marks the end of an answer
+  DEFAULT_WAIT_TIMEOUT = 2.0   # how long to wait for the first byte
+  DEFAULT_TIMEOUT      = 30.0  # inactivity limit in prompt/marker mode
+  DEFAULT_HISTORY      = 100
+  MARKER_GRACE         = 0.05  # time given to trailing output after a marker
+
+  class Error < StandardError; end
+
+  # Wraps the REPL child process. Communication goes over plain pipes (not a
+  # PTY) so that REPLs disable their line editors and emit clean output.
+  class Backend
+    attr_reader :command, :pid, :banner
+
+    def initialize(command, idle_timeout: DEFAULT_IDLE_TIMEOUT,
+                   wait_timeout: DEFAULT_WAIT_TIMEOUT, timeout: DEFAULT_TIMEOUT,
+                   prompt: nil, marker: nil)
+      @command = Array(command).map(&:to_s)
+      raise Error, 'kernel command is required' if @command.empty?
+
+      @idle_timeout = idle_timeout
+      @wait_timeout = wait_timeout
+      @timeout = timeout
+      @prompt = prompt && Regexp.new(prompt)
+      @marker = marker
+      @stdin, @stdout, @waiter = Open3.popen2e({ 'TERM' => 'dumb' }, *@command)
+      @pid = @waiter.pid
+      @banner = clean(sync_startup, '', nil)
+    rescue Errno::ENOENT => e
+      raise Error, "cannot start kernel: #{e.message}"
+    end
+
+    def alive?
+      @waiter.alive?
+    end
+
+    # Send one command to the REPL and return its output.
+    def execute(input)
+      raise Error, 'kernel is not running' unless alive?
+
+      command_text = input.to_s.sub(/\n+\z/, '')
+      return '' if command_text.strip.empty?
+
+      discard_pending
+      token = @marker ? new_token : nil
+      @stdin.puts(command_text)
+      @stdin.puts(format(@marker, token)) if token
+      @stdin.flush
+      clean(read_answer(token), command_text, token)
+    rescue Errno::EPIPE
+      raise Error, 'kernel has terminated'
+    end
+
+    def close
+      @stdin.close unless @stdin.closed?
+      @waiter.join(1) || (Process.kill('TERM', @pid) rescue nil)
+      @waiter.join(1) || (Process.kill('KILL', @pid) rescue nil)
+      @stdout.close unless @stdout.closed?
+      nil
+    rescue IOError, Errno::ESRCH
+      nil
+    end
+
+    private
+
+    def new_token
+      "REPL-#{SecureRandom.hex(8)}"
+    end
+
+    # Wait for the kernel to become ready and swallow its banner.
+    def sync_startup
+      if @marker
+        token = new_token
+        @stdin.puts(format(@marker, token))
+        @stdin.flush
+        read_answer(token)
+      elsif @prompt
+        read_answer(nil)
+      else
+        drain(@wait_timeout)
+      end
+    end
+
+    def read_answer(token)
+      if token
+        answer = read_while { |buf| buf.lines.any? { |l| l.strip == token } }
+        discard_pending(MARKER_GRACE) # the marker line's own return value
+        answer
+      elsif @prompt
+        read_while { |buf| @prompt.match?(buf.lines.last.to_s) }
+      else
+        drain(@wait_timeout)
+      end
+    end
+
+    # Throw away output left over from a previous command.
+    def discard_pending(timeout = 0)
+      drain_loop(timeout, timeout) { }
+    end
+
+    # Read until the block says we are done (or the kernel goes quiet for
+    # @timeout seconds).
+    def read_while(&done)
+      buffer = +''
+      drain_loop(@timeout, @timeout) do |chunk|
+        buffer << chunk
+        break if done.call(buffer)
+      end
+      buffer
+    end
+
+    # Read until the kernel is silent for @idle_timeout seconds.
+    def drain(first_wait)
+      buffer = +''
+      drain_loop(first_wait, @idle_timeout) { |chunk| buffer << chunk }
+      buffer
+    end
+
+    def drain_loop(first_wait, next_wait)
+      timeout = first_wait
+      loop do
+        break unless IO.select([@stdout], nil, nil, timeout)
+
+        chunk = read_chunk
+        break if chunk.nil?
+
+        yield chunk
+        timeout = next_wait
+      end
+    end
+
+    def read_chunk
+      @stdout.read_nonblock(4096)
+    rescue IO::WaitReadable
+      ''
+    rescue EOFError, Errno::EIO, IOError
+      nil
+    end
+
+    # Remove terminal noise: echoed input, marker lines and prompts.
+    def clean(raw, command_text, token)
+      lines = raw.to_s.gsub("\r\n", "\n").delete("\r").split("\n", -1)
+      if token
+        stop = lines.index { |l| l.strip == token }
+        lines = lines[0...stop] if stop
+        lines.reject! { |l| l.include?(token) }
+      end
+      lines = lines.map { |l| l.sub(@prompt, '') } if @prompt
+      drop_echo(lines, command_text)
+      lines.shift while lines.first&.strip&.empty?
+      lines.pop while lines.last&.strip&.empty?
+      lines.join("\n")
+    end
+
+    # REPLs reading from a pipe usually echo the input back.
+    def drop_echo(lines, command_text)
+      command_text.split("\n").each do |sent|
+        sent = sent.strip
+        next if sent.empty?
+
+        first = lines.first&.strip
+        lines.shift if first && (first == sent || first.end_with?(sent))
+      end
+    end
+  end
+
+  # Ring buffer of recent exchanges plus traffic counters.
+  class History
+    Entry = Struct.new(:time, :input, :output)
+
+    attr_reader :limit, :started_at
+
+    def initialize(limit = DEFAULT_HISTORY)
+      @limit = limit
+      @entries = []
+      @requests = 0
+      @in_bytes = 0
+      @out_bytes = 0
+      @started_at = Time.now
+      @mutex = Mutex.new
+    end
+
+    def record(input, output)
+      @mutex.synchronize do
+        @entries << Entry.new(Time.now, input.to_s, output.to_s)
+        @entries.shift while @entries.size > @limit
+        @requests += 1
+        @in_bytes += input.to_s.bytesize
+        @out_bytes += output.to_s.bytesize
+      end
+    end
+
+    def size
+      @mutex.synchronize { @entries.size }
+    end
+
+    def tail(count = 10)
+      @mutex.synchronize { @entries.last([count, 0].max) }
+    end
+
+    def stats
+      @mutex.synchronize do
+        { requests: @requests, in_bytes: @in_bytes, out_bytes: @out_bytes,
+          stored: @entries.size, started_at: @started_at,
+          uptime: Time.now - @started_at }
+      end
+    end
+  end
+
+  # Keeps track of running servers so that `repl send` needs no arguments when
+  # there is only one of them.
+  class Registry
+    def initialize(path = self.class.default_path)
+      @path = path
+    end
+
+    attr_reader :path
+
+    def self.default_path
+      home = ENV['REPL_HOME'] || File.join(Dir.home, '.repl')
+      File.join(home, 'servers.json')
+    end
+
+    def register(socket:, pid:, command:)
+      update do |entries|
+        entries.reject! { |e| e['socket'] == socket }
+        entries << { 'socket' => socket, 'pid' => pid,
+                     'command' => Array(command).join(' '),
+                     'started_at' => Time.now.to_i }
+      end
+    end
+
+    def unregister(socket)
+      update { |entries| entries.reject! { |e| e['socket'] == socket } }
+    end
+
+    # Live servers only; stale entries are pruned on read.
+    def servers
+      update { |entries| entries.select! { |e| live?(e) } }
+    end
+
+    private
+
+    def live?(entry)
+      return false unless File.socket?(entry['socket'].to_s)
+
+      Process.kill(0, entry['pid'].to_i)
+      true
+    rescue Errno::ESRCH, Errno::EPERM, TypeError
+      false
+    end
+
+    def update
+      FileUtils.mkdir_p(File.dirname(@path))
+      File.open(@path, File::RDWR | File::CREAT, 0o600) do |f|
+        f.flock(File::LOCK_EX)
+        entries = JSON.parse(f.read) rescue []
+        entries = [] unless entries.is_a?(Array)
+        yield entries
+        f.rewind
+        f.truncate(0)
+        f.write(JSON.pretty_generate(entries))
+        entries
+      end
+    end
+  end
+
+  # Sends a single command to a server and returns its output.
+  class Client
+    def self.call(socket_path, input)
+      raise Error, "no server socket at '#{socket_path}'" unless File.socket?(socket_path.to_s)
+
+      UNIXSocket.open(socket_path) do |sock|
+        sock.puts(JSON.generate('cmd' => input.to_s))
+        line = sock.gets
+        raise Error, 'server closed the connection without answering' unless line
+
+        response = JSON.parse(line)
+        raise Error, response['error'] if response['error']
+
+        response['out'].to_s
+      end
+    rescue Errno::ECONNREFUSED, Errno::ENOENT
+      raise Error, "cannot connect to '#{socket_path}'"
+    end
+  end
+
+  # Accepts client connections on a UNIX socket and serves the admin console.
+  class Server
+    ADMIN_HELP = <<~HELP.freeze
+      admin commands:
+        tail [n]     show latest messages (default 10)
+        stats        show input/output statistics
+        close, quit  stop the server
+        help         this text
+    HELP
+
+    attr_reader :socket_path, :history, :backend
+
+    def initialize(backend, socket_path: nil, registry: Registry.new,
+                   history: History.new, out: $stdout, prompt: '> ')
+      @backend = backend
+      @socket_path = socket_path || self.class.generate_socket_path
+      @registry = registry
+      @history = history
+      @out = out
+      @prompt = prompt
+      @mutex = Mutex.new
+      @running = false
+      @stopped = false
+    end
+
+    def self.generate_socket_path
+      name = (0...7).map { ('A'..'Z').to_a.sample }.join
+      File.join(Dir.tmpdir, "repl-kernel-#{name}")
+    end
+
+    def start
+      FileUtils.rm_f(@socket_path)
+      FileUtils.mkdir_p(File.dirname(@socket_path))
+      @server = UNIXServer.new(@socket_path)
+      File.chmod(0o600, @socket_path)
+      @registry.register(socket: @socket_path, pid: Process.pid,
+                         command: @backend.command)
+      @running = true
+      @acceptor = Thread.new { accept_loop }
+      self
+    end
+
+    def running?
+      @running
+    end
+
+    def stop
+      return self if @stopped
+
+      @stopped = true
+      @running = false
+      begin
+        @server&.close
+      rescue IOError
+        nil
+      end
+      @acceptor&.join(1)
+      FileUtils.rm_f(@socket_path)
+      @registry.unregister(@socket_path)
+      @backend.close
+      self
+    end
+
+    # Runs the admin console; returns when the user asks the server to stop.
+    def run_admin(input = $stdin)
+      loop do
+        @out.print(@prompt)
+        @out.flush
+        line = input.gets
+        break unless line
+
+        text, halt = admin_command(line)
+        @out.puts(text) if text
+        break if halt
+      end
+      stop
+    end
+
+    # Returns [output, stop_requested]
+    def admin_command(line)
+      name, arg = line.to_s.strip.split(/\s+/, 2)
+      case name
+      when nil, '' then [nil, false]
+      when 'close', 'quit', 'exit' then ['stopping', true]
+      when 'stats' then [format_stats, false]
+      when 'tail' then [format_tail(arg.nil? ? 10 : arg.to_i), false]
+      when 'help', '?' then [ADMIN_HELP, false]
+      else ["unknown command '#{name}' (try help)", false]
+      end
+    end
+
+    # Executes a command on the kernel and records it. Safe to call from
+    # several connection threads.
+    def execute(input)
+      output = @mutex.synchronize { @backend.execute(input) }
+      @history.record(input, output)
+      output
+    end
+
+    private
+
+    def accept_loop
+      while @running
+        begin
+          conn = @server.accept
+        rescue IOError, Errno::EBADF, Errno::EINVAL
+          break
+        end
+        Thread.new(conn) { |c| serve(c) }
+      end
+    end
+
+    def serve(conn)
+      while (line = conn.gets)
+        conn.puts(JSON.generate(handle_request(line)))
+      end
+    rescue Errno::EPIPE, IOError
+      nil
+    ensure
+      begin
+        conn.close
+      rescue IOError
+        nil
+      end
+    end
+
+    def handle_request(line)
+      request = JSON.parse(line)
+      raise Error, 'malformed request: "cmd" is missing' unless request.is_a?(Hash) && request.key?('cmd')
+
+      { 'out' => execute(request['cmd']) }
+    rescue JSON::ParserError
+      { 'error' => 'malformed request: invalid JSON' }
+    rescue Error => e
+      { 'error' => e.message }
+    end
+
+    def format_stats
+      s = @history.stats
+      format("socket:   %s\nkernel:   %s (pid %d, %s)\nuptime:   %.1fs\nrequests: %d\nin:       %d bytes\nout:      %d bytes",
+             @socket_path, @backend.command.join(' '), @backend.pid,
+             @backend.alive? ? 'running' : 'dead', s[:uptime], s[:requests],
+             s[:in_bytes], s[:out_bytes])
+    end
+
+    def format_tail(count)
+      entries = @history.tail(count)
+      return '(no messages yet)' if entries.empty?
+
+      entries.map do |e|
+        "[#{e.time.strftime('%H:%M:%S')}] < #{one_line(e.input)}\n" \
+          "           > #{one_line(e.output)}"
+      end.join("\n")
+    end
+
+    def one_line(text)
+      flat = text.to_s.strip.gsub(/\s*\n\s*/, ' ⏎ ')
+      flat.length > 100 ? "#{flat[0, 97]}..." : flat
+    end
+  end
+
+  # Command line front end.
+  class CLI
+    USAGE = <<~TEXT.freeze
+      Usage:
+        repl kernel [options] COMMAND [ARGS...]   start a REPL server
+        repl send [options] [TEXT...]             send a command (stdin if no TEXT)
+        repl list                                 list running servers
+        repl version | help
+
+      kernel options:
+        --socket PATH      socket to listen on (default: /tmp/repl-kernel-XXXXXXX)
+        --marker TEMPLATE  printf template making the kernel echo a token,
+                           e.g. --marker 'puts "%s"' (most reliable)
+        --prompt REGEX     regex matching the kernel prompt
+        --idle SECONDS     silence marking the end of an answer (default 0.3)
+        --wait SECONDS     wait for the first byte of an answer (default 2.0)
+        --timeout SECONDS  inactivity limit in marker/prompt mode (default 30)
+        --history N        number of messages kept for `tail` (default 100)
+
+      send options:
+        --socket PATH      server socket; defaults to $REPL_SOCKET or to the
+                           only running server
+    TEXT
+
+    def initialize(argv, out: $stdout, err: $stderr, stdin: $stdin,
+                   registry: Registry.new)
+      @argv = argv.dup
+      @out = out
+      @err = err
+      @stdin = stdin
+      @registry = registry
+    end
+
+    def run
+      command = @argv.shift
+      case command
+      when 'kernel' then cmd_kernel(@argv)
+      when 'send' then cmd_send(@argv)
+      when 'list' then cmd_list
+      when 'version', '--version', '-v' then @out.puts("repl #{VERSION}") || 0
+      when nil, 'help', '--help', '-h' then @out.puts(USAGE) || 0
+      else
+        @err.puts("unknown command '#{command}'\n\n#{USAGE}")
+        1
+      end
+    rescue Error => e
+      @err.puts("repl: #{e.message}")
+      1
+    end
+
+    # Resolution order: --socket, $REPL_SOCKET, the only running server.
+    def resolve_socket(explicit = nil)
+      return explicit if explicit && !explicit.empty?
+
+      from_env = ENV['REPL_SOCKET']
+      return from_env if from_env && !from_env.empty?
+
+      servers = @registry.servers
+      raise Error, 'no running server found; start one with `repl kernel CMD`' if servers.empty?
+
+      if servers.size > 1
+        list = servers.map { |s| "  #{s['socket']}  (#{s['command']})" }.join("\n")
+        raise Error, "several servers are running, use --socket:\n#{list}"
+      end
+      servers.first['socket']
+    end
+
+    private
+
+    def cmd_kernel(argv)
+      options = { history: DEFAULT_HISTORY, idle: DEFAULT_IDLE_TIMEOUT,
+                  wait: DEFAULT_WAIT_TIMEOUT, timeout: DEFAULT_TIMEOUT }
+      parser = OptionParser.new do |o|
+        o.on('--socket PATH') { |v| options[:socket] = v }
+        o.on('--marker TEMPLATE') { |v| options[:marker] = v }
+        o.on('--prompt REGEX') { |v| options[:prompt] = v }
+        o.on('--idle SECONDS', Float) { |v| options[:idle] = v }
+        o.on('--wait SECONDS', Float) { |v| options[:wait] = v }
+        o.on('--timeout SECONDS', Float) { |v| options[:timeout] = v }
+        o.on('--history N', Integer) { |v| options[:history] = v }
+        o.on('-h', '--help') { options[:help] = true }
+      end
+      command = parser.order(argv)
+      return (@out.puts(USAGE) || 0) if options[:help]
+      raise Error, "kernel command is required\n\n#{USAGE}" if command.empty?
+
+      backend = Backend.new(command, idle_timeout: options[:idle],
+                                     wait_timeout: options[:wait],
+                                     timeout: options[:timeout],
+                                     prompt: options[:prompt],
+                                     marker: options[:marker])
+      server = Server.new(backend, socket_path: options[:socket],
+                                   registry: @registry,
+                                   history: History.new(options[:history]),
+                                   out: @out)
+      server.start
+      @out.puts("Starting kernel '#{command.join(' ')}' on socket '#{server.socket_path}'")
+      %w[INT TERM].each { |sig| trap(sig) { server.stop; exit 0 } }
+      server.run_admin(@stdin)
+      0
+    end
+
+    def cmd_send(argv)
+      options = {}
+      parser = OptionParser.new do |o|
+        o.on('--socket PATH') { |v| options[:socket] = v }
+        o.on('-h', '--help') { options[:help] = true }
+      end
+      rest = parser.order(argv)
+      return (@out.puts(USAGE) || 0) if options[:help]
+
+      input = rest.empty? ? @stdin.read : rest.join(' ')
+      raise Error, 'nothing to send' if input.to_s.strip.empty?
+
+      output = Client.call(resolve_socket(options[:socket]), input)
+      @out.puts(output) unless output.empty?
+      0
+    end
+
+    def cmd_list
+      servers = @registry.servers
+      if servers.empty?
+        @out.puts('no running servers')
+      else
+        servers.each { |s| @out.puts("#{s['socket']}\t#{s['command']}\tpid #{s['pid']}") }
+      end
+      0
+    end
+  end
+end
+
+exit(Repl::CLI.new(ARGV).run) if $PROGRAM_NAME == __FILE__
