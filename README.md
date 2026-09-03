@@ -229,7 +229,41 @@ stops the server.
 Stopping the server (admin command, `Ctrl-D`, `SIGINT` or `SIGTERM`) shuts the
 kernel down, removes the socket and unregisters the server.
 
+## Vim plugin
+
+`vim/` is a self-contained plugin wiring `editor-send` and `post` to keys. Add
+the directory to the runtime path (`set runtimepath+=~/src/repl/vim`, or point
+your plugin manager at this repo) and start a kernel outside Vim.
+
+Filtering replaces the region with the crafted answer, posting leaves the
+buffer alone, clearing empties the output blocks back to a bare `#=>`:
+
+| keys | region | action |
+| --- | --- | --- |
+| `<Leader>rp` | paragraph | `editor-send` |
+| `<Leader>rs` | the surrounding ` ``` ` block | `editor-send` |
+| `<Leader>rm{motion}` | the lines of `{motion}` | `editor-send` |
+| `<Leader>rp`, `<Leader>rs` (visual) | the selected lines | `editor-send` |
+| `<Leader>Rp`, `<Leader>Rs`, `<Leader>Rm{motion}`, `<Leader>Rp`/`<Leader>Rs` (visual) | the same regions | `post` |
+| `<Leader>rcp`, `<Leader>rcs`, `<Leader>rcm{motion}`, `<Leader>rc` (visual) | the same regions | clear |
+
+In visual mode the region is always the selection, so the trailing `p` and `s`
+lead to the same place; no default binding is the prefix of another one, so
+none of them waits for `timeout`.
+
+The same as commands: `:[range]ReplSend`, `:[range]ReplPost`,
+`:[range]ReplClear` (the whole buffer by default), `:ReplSendParagraph`,
+`:ReplSendSection`, `:ReplPostParagraph`, `:ReplPostSection`,
+`:ReplParagraphClear`, `:ReplSectionClear`.
+
+`g:repl_command` picks the script (by default `./repl`, then the copy next to
+the plugin, then `repl` on `$PATH`), `g:repl_socket` or `b:repl_socket` picks
+the kernel, and `g:repl_no_mappings` turns the default bindings off in favour
+of the `<Plug>(repl-send-...)`, `<Plug>(repl-post-...)` and
+`<Plug>(repl-clear-...)` targets. See `:help repl-vim`.
+
 # TODO
 
-- Intrdocude 'restart' admin command
+- Intrdocude 'restart' admin command (it should re-run the same kernel) 
 - Fix 'tail' as though it can continiously show updates
+- Backend sometimes hangs. As a results all post/send commands returns with no output

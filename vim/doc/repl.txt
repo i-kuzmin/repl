@@ -1,0 +1,141 @@
+*repl.txt*   Send buffer regions to a `repl` kernel            *repl* *repl-vim*
+
+==============================================================================
+CONTENTS                                                       *repl-contents*
+
+    1. Introduction .......................... |repl-introduction|
+    2. Regions ............................... |repl-regions|
+    3. Commands .............................. |repl-commands|
+    4. Mappings .............................. |repl-mappings|
+    5. Configuration ......................... |repl-configuration|
+
+==============================================================================
+1. INTRODUCTION                                            *repl-introduction*
+
+This plugin drives the `repl` script: a small server that keeps a REPL alive
+and answers requests over a unix socket. Start a kernel outside Vim, then send
+it pieces of the buffer: >
+
+    $ repl kernel --marker 'puts "%s"' irb
+<
+Two ways of sending a region:
+
+filter      the region is piped through `repl editor-send` and replaced by
+            what it prints. `editor-send` echoes the code back with every
+            `#=>` output block filled in with a fresh answer, so the buffer
+            keeps the code and gains the results.
+
+post        the region is written to `repl post`; no answer is expected and
+            the buffer is left untouched. Useful to feed a kernel that is
+            blocked reading its standard input.
+
+and one way of undoing them:
+
+clear       every output block in the region is emptied: the answer between
+            `#=>` and `#==` is deleted along with the `#==`, leaving the bare
+            `#=>` opener ready for a fresh run. A block that has no `#==` ends
+            at the first line that is not a comment, exactly as `editor-send`
+            reads it.
+
+==============================================================================
+2. REGIONS                                                      *repl-regions*
+
+paragraph   the run of non-blank lines around the cursor.
+
+section     the markdown code block around the cursor, i.e. the lines between
+            the surrounding ``` fences, fences included. `editor-send` keeps
+            the fences in its answer but hides them from the kernel. A block
+            that is never closed extends to the end of the buffer.
+
+selection   the lines touched by the Visual selection. The transfer is always
+            linewise.
+
+motion      any motion or text object, through the operator mappings.
+
+==============================================================================
+3. COMMANDS                                                    *repl-commands*
+
+:[range]ReplSend                                                    *:ReplSend*
+            Filter [range] (default: the current line) through
+            `repl editor-send` and replace it with the answer.
+
+:[range]ReplPost                                                    *:ReplPost*
+            Write [range] (default: the current line) to `repl post`.
+
+:[range]ReplClear                                                  *:ReplClear*
+            Empty every output block in [range] (default: the whole buffer),
+            keeping the `#=>` openers.
+
+:ReplSendParagraph                                         *:ReplSendParagraph*
+:ReplSendSection                                             *:ReplSendSection*
+:ReplPostParagraph                                         *:ReplPostParagraph*
+:ReplPostSection                                             *:ReplPostSection*
+:ReplParagraphClear                                       *:ReplParagraphClear*
+:ReplSectionClear                                           *:ReplSectionClear*
+            The same on the paragraph or the ``` block under the cursor.
+
+==============================================================================
+4. MAPPINGS                                                    *repl-mappings*
+
+Default bindings, filtering: >
+
+    <Leader>rp        paragraph
+    <Leader>rs        ``` block
+    <Leader>rm{motion}  the lines covered by {motion}, e.g. <Leader>rmap
+    <Leader>rp        the selection                (Visual mode)
+    <Leader>rs        the selection                (Visual mode)
+<
+posting: >
+
+    <Leader>Rp        paragraph
+    <Leader>Rs        ``` block
+    <Leader>Rm{motion}  the lines covered by {motion}
+    <Leader>Rp        the selection                (Visual mode)
+    <Leader>Rs        the selection                (Visual mode)
+<
+and clearing: >
+
+    <Leader>rcp       paragraph
+    <Leader>rcs       ``` block
+    <Leader>rcm{motion}  the lines covered by {motion}
+    <Leader>rc        the selection                (Visual mode)
+<
+In Visual mode the region is always the selection, so the trailing 'p' and 's'
+lead to the same place; they are kept so that the fingers do not have to know
+which mode they are in. No default binding is the prefix of another one, so
+none of them waits for 'timeout' before firing.
+
+Set |g:repl_no_mappings| and map the |<Plug>| targets yourself: >
+
+    let g:repl_no_mappings = 1
+    nmap <buffer> <C-c><C-c> <Plug>(repl-send-paragraph)
+    xmap <buffer> <C-c><C-c> <Plug>(repl-send)
+<
+Available targets: >
+
+    <Plug>(repl-send-paragraph)  <Plug>(repl-post-paragraph)  <Plug>(repl-clear-paragraph)
+    <Plug>(repl-send-section)    <Plug>(repl-post-section)    <Plug>(repl-clear-section)
+    <Plug>(repl-send)            <Plug>(repl-post)            <Plug>(repl-clear)
+    <Plug>(repl-send-operator)   <Plug>(repl-post-operator)   <Plug>(repl-clear-operator)
+<
+==============================================================================
+5. CONFIGURATION                                          *repl-configuration*
+
+                                                              *g:repl_command*
+The `repl` script to run. When empty the plugin takes `./repl` if it is
+executable, then the copy sitting next to the plugin, then `repl` from $PATH. >
+
+    let g:repl_command = '~/src/repl/repl'
+<
+                                                               *g:repl_socket*
+                                                               *b:repl_socket*
+The kernel socket, passed as `--socket`. When empty `repl` falls back to
+$REPL_SOCKET, or to the only running server. `b:repl_socket` wins over
+`g:repl_socket`, so different buffers can talk to different kernels. >
+
+    let b:repl_socket = '/tmp/repl-kernel-python'
+<
+                                                          *g:repl_no_mappings*
+Set to 1 to skip the default bindings.
+
+ vim:tw=78:ts=8:ft=help:norl:
