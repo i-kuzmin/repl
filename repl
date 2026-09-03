@@ -25,6 +25,19 @@ module Repl
   DEFAULT_TIMEOUT      = 30.0  # inactivity limit in prompt/marker mode
   DEFAULT_HISTORY      = 100
   MARKER_GRACE         = 0.05  # time given to trailing output after a marker
+  POST_GRACE           = 0.2   # time given to the answer of a `post` nobody read
+
+  # Control characters and friendly names accepted by `repl signal`.
+  SIGNAL_ALIASES = {
+    "\x03" => 'INT',  '^C' => 'INT',  'CTRL-C' => 'INT',  'C-C' => 'INT',
+    "\x1A" => 'TSTP', '^Z' => 'TSTP', 'CTRL-Z' => 'TSTP', 'C-Z' => 'TSTP',
+    "\x1C" => 'QUIT', '^\\' => 'QUIT', 'CTRL-\\' => 'QUIT',
+    "\x04" => 'EOF',  '^D' => 'EOF',  'CTRL-D' => 'EOF',  'C-D' => 'EOF'
+  }.freeze
+
+  # Signals a terminal generates from a keystroke; they are aimed at the
+  # foreground job rather than at the shell that started it.
+  TERMINAL_SIGNALS = %w[INT QUIT TSTP].freeze
 
   class Error < StandardError; end
 
@@ -44,7 +57,11 @@ module Repl
       @timeout = timeout
       @prompt = prompt && Regexp.new(prompt)
       @marker = marker
-      @stdin, @stdout, @waiter = Open3.popen2e({ 'TERM' => 'dumb' }, *@command)
+      @echo = false # set once the kernel is seen echoing its input
+      @posted = false # true while an unread answer of a `post` may be coming
+      # Own process group, so that signals reach the kernel and its children
+      # without touching the server itself.
+      @stdin, @stdout, @waiter = Open3.popen2e({ 'TERM' => 'dumb' }, *@command, pgroup: true)
       @pid = @waiter.pid
       @banner = clean(sync_startup, '', nil)
     rescue Errno::ENOENT => e
@@ -62,7 +79,10 @@ module Repl
       command_text = input.to_s.sub(/\n+\z/, '')
       return '' if command_text.strip.empty?
 
-      discard_pending
+      # A previous `post` may still be answering; give it time to arrive so
+      # that its output is dropped here and not mixed into this answer.
+      discard_pending(@posted ? POST_GRACE : 0)
+      @posted = false
       token = @marker ? new_token : nil
       @stdin.puts(command_text)
       @stdin.puts(format(@marker, token)) if token
@@ -72,8 +92,48 @@ module Repl
       raise Error, 'kernel has terminated'
     end
 
+    # Write a command to the kernel without reading its answer. Never waits
+    # for output, so it also works while another command is running (it then
+    # feeds that command's stdin).
+    def post(input)
+      raise Error, 'kernel is not running' unless alive?
+
+      command_text = input.to_s.sub(/\n+\z/, '')
+      return '' if command_text.strip.empty?
+
+      @stdin.puts(command_text)
+      @stdin.flush
+      @posted = true
+      command_text
+    rescue Errno::EPIPE, IOError
+      raise Error, 'kernel has terminated'
+    end
+
+    # Send a signal (or a control character such as "^C") to the kernel.
+    # Never blocks, so it works while a command is still running.
+    def signal(name)
+      signal = self.class.normalize_signal(name)
+      raise Error, 'kernel is not running' unless alive?
+
+      if signal == 'EOF'
+        close_input
+        return 'EOF'
+      end
+      deliver(signal)
+      signal
+    end
+
+    def self.normalize_signal(name)
+      key = name.to_s.strip
+      key = SIGNAL_ALIASES[key] || SIGNAL_ALIASES[key.upcase] || key.upcase
+      key = key.sub(/\ASIG/, '')
+      return key if key == 'EOF' || Signal.list.key?(key)
+
+      raise Error, "unknown signal '#{name}'"
+    end
+
     def close
-      @stdin.close unless @stdin.closed?
+      close_input
       @waiter.join(1) || (Process.kill('TERM', @pid) rescue nil)
       @waiter.join(1) || (Process.kill('KILL', @pid) rescue nil)
       @stdout.close unless @stdout.closed?
@@ -83,6 +143,96 @@ module Repl
     end
 
     private
+
+    # Terminal-generated signals go to the foreground job, i.e. to the
+    # kernel's own children when it is running one. Shells (bash, sh, ...)
+    # quit when a SIGINT of their own arrives, so hitting the whole process
+    # group would kill the kernel instead of the command it is running.
+    def deliver(signal)
+      if TERMINAL_SIGNALS.include?(signal)
+        job = descendants
+        unless job.empty?
+          job.each { |pid| Process.kill(signal, pid) rescue nil }
+          return
+        end
+      end
+      signal_group(signal)
+    end
+
+    # Signal the whole process group; fall back to the process itself.
+    def signal_group(signal)
+      Process.kill(signal, -@pid)
+    rescue Errno::ESRCH, Errno::EPERM
+      begin
+        Process.kill(signal, @pid)
+      rescue Errno::ESRCH
+        raise Error, 'kernel is not running'
+      end
+    end
+
+    # Every process below the kernel, children first.
+    def descendants
+      children = child_map
+      found = []
+      queue = [@pid]
+      until queue.empty?
+        children[queue.shift].to_a.each do |pid|
+          next if found.include?(pid)
+
+          found << pid
+          queue << pid
+        end
+      end
+      found
+    end
+
+    # pid => [child pid, ...] for every process on the machine.
+    def child_map
+      map = Hash.new { |h, k| h[k] = [] }
+      each_process { |pid, ppid| map[ppid] << pid }
+      map
+    end
+
+    def each_process
+      if File.directory?('/proc/self')
+        each_proc_process { |pid, ppid| yield pid, ppid }
+      else
+        each_ps_process { |pid, ppid| yield pid, ppid }
+      end
+    end
+
+    def each_proc_process
+      Dir.glob('/proc/[0-9]*/stat').each do |path|
+        stat = begin
+          File.read(path)
+        rescue SystemCallError, IOError
+          next
+        end
+        # "pid (comm) state ppid ..." -- comm may contain spaces and ')'.
+        tail = stat[(stat.rindex(') ') || -2) + 2, stat.length].to_s.split
+        pid = File.basename(File.dirname(path)).to_i
+        ppid = tail[1].to_i
+        yield pid, ppid if pid.positive? && ppid.positive?
+      end
+    end
+
+    def each_ps_process
+      out, status = Open3.capture2e('ps', '-eo', 'pid=,ppid=')
+      return unless status.success?
+
+      out.each_line do |line|
+        pid, ppid = line.split.map(&:to_i)
+        yield pid, ppid if pid&.positive? && ppid&.positive?
+      end
+    rescue SystemCallError
+      nil
+    end
+
+    def close_input
+      @stdin.close unless @stdin.closed?
+    rescue IOError
+      nil
+    end
 
     def new_token
       "REPL-#{SecureRandom.hex(8)}"
@@ -173,15 +323,138 @@ module Repl
       lines.join("\n")
     end
 
-    # REPLs reading from a pipe usually echo the input back.
+    # REPLs reading from a pipe usually echo the input back -- but not all of
+    # them do, so a line is only treated as an echo when the kernel is known to
+    # echo, or when real output follows it.
     def drop_echo(lines, command_text)
       command_text.split("\n").each do |sent|
         sent = sent.strip
         next if sent.empty?
 
         first = lines.first&.strip
-        lines.shift if first && (first == sent || first.end_with?(sent))
+        next unless first && (first == sent || first.end_with?(sent))
+        next unless @echo || lines.drop(1).any? { |l| !l.strip.empty? }
+
+        lines.shift
+        @echo = true
       end
+    end
+  end
+
+  # Input preprocessing and output crafting for `repl editor-send`.
+  #
+  # The input is a piece of an editor buffer: possibly wrapped in a markdown
+  # code fence and interleaved with output blocks that open with '#=>' and
+  # close with '#==' (or with the first line that is not a comment). The text
+  # is echoed back with every output block replaced by a fresh answer, so the
+  # editor can substitute the region it fed in with the result.
+  module Editor
+    OPEN  = '#=>'
+    CLOSE = '#=='
+    FENCE = /\A\s*```/.freeze
+
+    # One command plus the flag telling whether its output is shown.
+    Chunk = Struct.new(:code, :block) do
+      def command
+        code.join("\n").strip
+      end
+    end
+
+    Document = Struct.new(:head, :chunks, :tail)
+
+    # Parse, run every chunk through the given block, and return the crafted
+    # text.
+    def self.run(text)
+      document = parse(text)
+      outputs = document.chunks.map do |chunk|
+        command = chunk.command
+        command.empty? ? '' : yield(command)
+      end
+      render(document, outputs)
+    end
+
+    # Splits the text on '#=>' markers; stale output blocks are dropped. The
+    # markdown fences are kept aside, out of the way of the kernel.
+    def self.parse(text)
+      lines = text.to_s.gsub("\r\n", "\n").delete("\r").split("\n", -1)
+      head, tail = split_fences(lines)
+      chunks = []
+      code = []
+      index = 0
+      while index < lines.size
+        if lines[index].strip == OPEN
+          index = skip_block(lines, index + 1)
+          chunks << Chunk.new(code, true)
+          code = []
+        else
+          code << lines[index]
+          index += 1
+        end
+      end
+      chunks << Chunk.new(code, false) unless code.empty? && !chunks.empty?
+      chunks << Chunk.new([], true) if chunks.empty?
+      # Without any marker the answer of the last (only) command is appended.
+      chunks.last.block = true if chunks.none?(&:block)
+      Document.new(head, chunks, tail)
+    end
+
+    def self.render(document, outputs)
+      lines = document.head.dup
+      document.chunks.each_with_index do |chunk, i|
+        code = chunk.code.dup
+        # Blank lines at the end of the code belong after the block.
+        blanks = chunk.block ? pop_blanks(code) : []
+        lines.concat(code)
+        lines.concat(block(outputs[i])) if chunk.block
+        lines.concat(blanks)
+      end
+      lines.concat(document.tail)
+      lines.join("\n")
+    end
+
+    def self.pop_blanks(code)
+      blanks = []
+      blanks.unshift(code.pop) while !code.empty? && code.last.strip.empty?
+      blanks
+    end
+
+    # An output block: the markers plus the answer, one '# ' per line.
+    def self.block(output)
+      [OPEN, *comment(output), CLOSE]
+    end
+
+    def self.comment(output)
+      output.to_s.split("\n").map { |line| line.empty? ? '#' : "# #{line}" }
+    end
+
+    # Take a leading and/or trailing markdown fence off the code.
+    def self.split_fences(lines)
+      head = []
+      tail = []
+      first = lines.index { |l| !l.strip.empty? }
+      head = lines.shift(first + 1) if first && FENCE.match?(lines[first])
+      last = lines.rindex { |l| !l.strip.empty? }
+      tail = lines.slice!(last..-1) if last && FENCE.match?(lines[last])
+      [head, tail]
+    end
+
+    # Skip the previous output of a block, i.e. comment lines up to a '#=='
+    # terminator or up to the first line that is not a comment.
+    def self.skip_block(lines, index)
+      while index < lines.size
+        line = lines[index].strip
+        return index + 1 if line == CLOSE
+        return index unless line.start_with?('#') || line.empty?
+
+        # Blank lines belong to the block only when '#==' still follows.
+        if line.empty?
+          nxt = index
+          nxt += 1 while nxt < lines.size && lines[nxt].strip.empty?
+          return lines[nxt]&.strip == CLOSE ? nxt + 1 : index
+        end
+        index += 1
+      end
+      index
     end
   end
 
@@ -286,13 +559,25 @@ module Repl
     end
   end
 
-  # Sends a single command to a server and returns its output.
+  # Sends a single request to a server and returns its output.
   class Client
     def self.call(socket_path, input)
+      request(socket_path, 'cmd' => input.to_s)
+    end
+
+    def self.post(socket_path, input)
+      request(socket_path, 'post' => input.to_s)
+    end
+
+    def self.signal(socket_path, name)
+      request(socket_path, 'signal' => name.to_s)
+    end
+
+    def self.request(socket_path, payload)
       raise Error, "no server socket at '#{socket_path}'" unless File.socket?(socket_path.to_s)
 
       UNIXSocket.open(socket_path) do |sock|
-        sock.puts(JSON.generate('cmd' => input.to_s))
+        sock.puts(JSON.generate(payload))
         line = sock.gets
         raise Error, 'server closed the connection without answering' unless line
 
@@ -310,10 +595,18 @@ module Repl
   class Server
     ADMIN_HELP = <<~HELP.freeze
       admin commands:
-        tail [n]     show latest messages (default 10)
-        stats        show input/output statistics
-        close, quit  stop the server
-        help         this text
+        tail [n]          show latest messages (default 10)
+        stats             show input/output statistics
+        post COMMAND      send COMMAND to the kernel without waiting for output
+        attach [COMMAND]  talk to the kernel: run COMMAND once, or without
+                          arguments enter attached mode ('detach' to leave;
+                          Ctrl-C is forwarded to the kernel)
+        signal [NAME]     send a signal or control character to the kernel
+                          (default INT); e.g. signal ^C, signal TSTP
+        interrupt         alias for `signal INT`
+        eof               close the kernel's input (Ctrl-D)
+        close, quit       stop the server
+        help              this text
     HELP
 
     attr_reader :socket_path, :history, :backend
@@ -329,6 +622,7 @@ module Repl
       @mutex = Mutex.new
       @running = false
       @stopped = false
+      @attached = false
     end
 
     def self.generate_socket_path
@@ -377,23 +671,69 @@ module Repl
         line = input.gets
         break unless line
 
-        text, halt = admin_command(line)
+        text, action = admin_command(line)
         @out.puts(text) if text
-        break if halt
+        break if action == :stop
+        run_attached(input) if action == :attach
       end
       stop
     end
 
-    # Returns [output, stop_requested]
+    # Attached mode: every line goes to the kernel until 'detach' or EOF.
+    def run_attached(input = $stdin)
+      @attached = true
+      loop do
+        @out.print(attach_prompt)
+        @out.flush
+        line = input.gets
+        break unless line
+
+        break if %w[detach .].include?(line.strip)
+        next if line.strip.empty?
+
+        @out.puts(run_kernel_command(line))
+      end
+      @out.puts('detached')
+    ensure
+      @attached = false
+    end
+
+    def attached?
+      @attached
+    end
+
+    # In attached mode the console stands in for the kernel's terminal, so
+    # Ctrl-C must reach the kernel instead of stopping the server. Returns
+    # true when the interrupt was forwarded. Runs in a signal handler, so it
+    # must stay lock free (no history recording).
+    def forward_interrupt
+      return false unless @attached && @backend.alive?
+
+      @backend.signal('INT')
+      true
+    rescue Error, SystemCallError
+      false
+    end
+
+    def attach_prompt
+      "#{File.basename(@backend.command.first)}#{@prompt}"
+    end
+
+    # Returns [output, action] where action is nil, :stop or :attach.
     def admin_command(line)
       name, arg = line.to_s.strip.split(/\s+/, 2)
       case name
-      when nil, '' then [nil, false]
-      when 'close', 'quit', 'exit' then ['stopping', true]
-      when 'stats' then [format_stats, false]
-      when 'tail' then [format_tail(arg.nil? ? 10 : arg.to_i), false]
-      when 'help', '?' then [ADMIN_HELP, false]
-      else ["unknown command '#{name}' (try help)", false]
+      when nil, '' then [nil, nil]
+      when 'close', 'quit', 'exit' then ['stopping', :stop]
+      when 'stats' then [format_stats, nil]
+      when 'tail' then [format_tail(arg.nil? ? 10 : arg.to_i), nil]
+      when 'post' then [safely { post(arg.to_s) }, nil]
+      when 'attach' then arg ? [run_kernel_command(arg), nil] : [nil, :attach]
+      when 'signal' then [safely { signal(arg || 'INT') }, nil]
+      when 'interrupt', 'int' then [safely { signal('INT') }, nil]
+      when 'eof' then [safely { signal('EOF') }, nil]
+      when 'help', '?' then [ADMIN_HELP, nil]
+      else ["unknown command '#{name}' (try help)", nil]
       end
     end
 
@@ -405,7 +745,39 @@ module Repl
       output
     end
 
+    # Signals are delivered without taking the kernel lock, so they can
+    # interrupt a command that is still running.
+    # Posts go straight to the kernel's input without taking the kernel lock,
+    # so they never wait for an answer and can also feed a command that is
+    # still running.
+    def post(input)
+      @backend.post(input)
+      text = 'posted'
+      @history.record(input, text)
+      text
+    end
+
+    def signal(name)
+      sent = @backend.signal(name)
+      text = sent == 'EOF' ? 'closed kernel input (EOF)' : "sent SIG#{sent} to pid #{@backend.pid}"
+      @history.record("<signal #{name}>", text)
+      text
+    end
+
     private
+
+    def run_kernel_command(line)
+      output = execute(line)
+      output.empty? ? '(no output)' : output
+    rescue Error => e
+      "error: #{e.message}"
+    end
+
+    def safely
+      yield
+    rescue Error => e
+      "error: #{e.message}"
+    end
 
     def accept_loop
       while @running
@@ -434,9 +806,17 @@ module Repl
 
     def handle_request(line)
       request = JSON.parse(line)
-      raise Error, 'malformed request: "cmd" is missing' unless request.is_a?(Hash) && request.key?('cmd')
+      raise Error, 'malformed request: not an object' unless request.is_a?(Hash)
 
-      { 'out' => execute(request['cmd']) }
+      if request.key?('cmd')
+        { 'out' => execute(request['cmd']) }
+      elsif request.key?('post')
+        { 'out' => post(request['post']) }
+      elsif request.key?('signal')
+        { 'out' => signal(request['signal']) }
+      else
+        raise Error, 'malformed request: "cmd" is missing'
+      end
     rescue JSON::ParserError
       { 'error' => 'malformed request: invalid JSON' }
     rescue Error => e
@@ -473,6 +853,10 @@ module Repl
       Usage:
         repl kernel [options] COMMAND [ARGS...]   start a REPL server
         repl send [options] [TEXT...]             send a command (stdin if no TEXT)
+        repl post [options] [TEXT...]             send a command, expect no answer
+        repl editor-send [options] [TEXT...]      send an editor region and craft
+                                                  its output back
+        repl signal [options] [NAME]              signal the kernel (default INT)
         repl list                                 list running servers
         repl version | help
 
@@ -486,9 +870,12 @@ module Repl
         --timeout SECONDS  inactivity limit in marker/prompt mode (default 30)
         --history N        number of messages kept for `tail` (default 100)
 
-      send options:
+      send/post/editor-send/signal options:
         --socket PATH      server socket; defaults to $REPL_SOCKET or to the
                            only running server
+
+      signal names: INT, TSTP, CONT, TERM, ... or control characters such as
+      ^C, ^Z, ^D (EOF closes the kernel's input).
     TEXT
 
     def initialize(argv, out: $stdout, err: $stderr, stdin: $stdin,
@@ -505,6 +892,9 @@ module Repl
       case command
       when 'kernel' then cmd_kernel(@argv)
       when 'send' then cmd_send(@argv)
+      when 'post' then cmd_post(@argv)
+      when 'editor-send' then cmd_editor_send(@argv)
+      when 'signal' then cmd_signal(@argv)
       when 'list' then cmd_list
       when 'version', '--version', '-v' then @out.puts("repl #{VERSION}") || 0
       when nil, 'help', '--help', '-h' then @out.puts(USAGE) || 0
@@ -564,12 +954,63 @@ module Repl
                                    out: @out)
       server.start
       @out.puts("Starting kernel '#{command.join(' ')}' on socket '#{server.socket_path}'")
-      %w[INT TERM].each { |sig| trap(sig) { server.stop; exit 0 } }
+      trap('INT') do
+        next if server.forward_interrupt
+
+        server.stop
+        exit 0
+      end
+      trap('TERM') { server.stop; exit 0 }
       server.run_admin(@stdin)
       0
     end
 
     def cmd_send(argv)
+      input, options = read_input(argv)
+      return 0 unless input
+
+      output = Client.call(resolve_socket(options[:socket]), input)
+      @out.puts(output) unless output.empty?
+      0
+    end
+
+    def cmd_post(argv)
+      input, options = read_input(argv)
+      return 0 unless input
+
+      Client.post(resolve_socket(options[:socket]), input)
+      0
+    end
+
+    def cmd_editor_send(argv)
+      input, options = read_input(argv)
+      return 0 unless input
+
+      socket = resolve_socket(options[:socket])
+      @out.puts(Editor.run(input) { |command| Client.call(socket, command) })
+      0
+    end
+
+    # Shared front end of send/post/editor-send: options, then TEXT or stdin.
+    def read_input(argv)
+      options = {}
+      parser = OptionParser.new do |o|
+        o.on('--socket PATH') { |v| options[:socket] = v }
+        o.on('-h', '--help') { options[:help] = true }
+      end
+      rest = parser.order(argv)
+      if options[:help]
+        @out.puts(USAGE)
+        return [nil, nil]
+      end
+
+      input = rest.empty? ? @stdin.read : rest.join(' ')
+      raise Error, 'nothing to send' if input.to_s.strip.empty?
+
+      [input, options]
+    end
+
+    def cmd_signal(argv)
       options = {}
       parser = OptionParser.new do |o|
         o.on('--socket PATH') { |v| options[:socket] = v }
@@ -578,11 +1019,8 @@ module Repl
       rest = parser.order(argv)
       return (@out.puts(USAGE) || 0) if options[:help]
 
-      input = rest.empty? ? @stdin.read : rest.join(' ')
-      raise Error, 'nothing to send' if input.to_s.strip.empty?
-
-      output = Client.call(resolve_socket(options[:socket]), input)
-      @out.puts(output) unless output.empty?
+      name = rest.first || 'INT'
+      @out.puts(Client.signal(resolve_socket(options[:socket]), name))
       0
     end
 

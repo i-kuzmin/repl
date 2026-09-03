@@ -25,6 +25,15 @@ module TestHelpers
     end
   RUBY
 
+  # Shrugs off INT and TSTP, so a test can send them without racing the
+  # kernel's death.
+  PATIENT_REPL = <<~RUBY
+    STDOUT.sync = true
+    Signal.trap("INT") { }
+    Signal.trap("TSTP") { }
+    while STDIN.gets; end
+  RUBY
+
   # No prompt, no echo, and silent for comments: exercises idle mode.
   SILENT_REPL = <<~RUBY
     STDOUT.sync = true
@@ -123,10 +132,26 @@ class BackendTest < Minitest::Test
   end
 
   def test_silent_command_returns_empty_output
-    with_backend(SILENT_REPL, wait_timeout: 0.4, idle_timeout: 0.2) do |b|
+    with_backend(SILENT_REPL, wait_timeout: 2.0, idle_timeout: 0.2) do |b|
       assert_equal '', b.execute('# just a comment')
       assert_equal '9', b.execute('x = 9')
       assert_equal '9', b.execute('x')
+    end
+  end
+
+  # A non-echoing kernel whose answer happens to repeat the input must not
+  # have that answer mistaken for an echo.
+  def test_output_equal_to_input_is_kept_for_non_echoing_kernels
+    with_backend(SILENT_REPL, wait_timeout: 2.0, idle_timeout: 0.2) do |b|
+      assert_equal '7', b.execute('7')
+      assert_equal '7', b.execute('7')
+    end
+  end
+
+  def test_echo_is_stripped_when_answer_repeats_the_input
+    with_backend(prompt: 'fake> ') do |b|
+      assert_equal '7', b.execute('7')
+      assert_equal '7', b.execute('7')
     end
   end
 
@@ -168,6 +193,248 @@ class BackendTest < Minitest::Test
 
   def test_empty_command_raises
     assert_raises(Repl::Error) { Repl::Backend.new([]) }
+  end
+end
+
+class SignalTest < Minitest::Test
+  include TestHelpers
+
+  # A REPL that blocks on `sleep` and survives SIGINT, like irb does.
+  BLOCKING_REPL = <<~RUBY
+    STDOUT.sync = true
+    b = binding
+    Signal.trap("INT") { raise Interrupt }
+    while (line = STDIN.gets)
+      begin
+        puts eval(line, b).inspect
+      rescue Interrupt
+        puts "interrupted"
+      rescue StandardError => e
+        puts "ERR: \#{e.message}"
+      end
+    end
+  RUBY
+
+  def test_normalize_signal_accepts_names_and_control_characters
+    n = Repl::Backend.method(:normalize_signal)
+    assert_equal 'INT', n.call('INT')
+    assert_equal 'INT', n.call('sigint')
+    assert_equal 'INT', n.call('^C')
+    assert_equal 'INT', n.call("\x03")
+    assert_equal 'INT', n.call('ctrl-c')
+    assert_equal 'TSTP', n.call('^Z')
+    assert_equal 'QUIT', n.call("\x1C")
+    assert_equal 'EOF', n.call('^D')
+    assert_equal 'TERM', n.call('TERM')
+  end
+
+  def test_normalize_signal_rejects_nonsense
+    assert_raises(Repl::Error) { Repl::Backend.normalize_signal('NOSUCHSIG') }
+  end
+
+  def test_signal_interrupts_a_blocking_command
+    backend = Repl::Backend.new(fake_kernel(BLOCKING_REPL), wait_timeout: 5.0,
+                                                            idle_timeout: 0.2)
+    started = Time.now
+    thread = Thread.new { backend.execute('sleep 30') }
+    sleep 0.7
+    assert_equal 'INT', backend.signal('^C')
+    assert_equal 'interrupted', thread.value
+    assert_operator Time.now - started, :<, 10
+    # kernel is still usable afterwards
+    assert_equal '4', backend.execute('2 + 2')
+  ensure
+    backend&.close
+  end
+
+  # A shell quits when it gets a SIGINT of its own, so Ctrl-C has to reach the
+  # command it is running, exactly like the foreground job of a terminal.
+  def test_interrupt_hits_the_kernels_job_and_spares_the_shell
+    skip 'bash is not available' unless File.executable?('/bin/bash')
+
+    # A test runner started as a background job ignores INT; children would
+    # inherit that and become immune to the signal.
+    previous = Signal.trap('INT', 'DEFAULT')
+    backend = Repl::Backend.new(['/bin/bash'], wait_timeout: 2.0, idle_timeout: 0.2)
+    Thread.new { backend.execute('sleep 30') }
+    sleep 0.7
+    assert_equal 'INT', backend.signal('^C')
+    sleep 0.3
+    assert_predicate backend, :alive?, 'the shell survives Ctrl-C'
+    # answers again, i.e. the sleep is really gone
+    assert_equal 'still here', backend.execute('echo still here')
+  ensure
+    Signal.trap('INT', previous || 'DEFAULT')
+    backend&.close
+  end
+
+  def test_eof_closes_kernel_input
+    backend = Repl::Backend.new(fake_kernel, prompt: 'fake> ')
+    assert_equal 'EOF', backend.signal('^D')
+    sleep 0.3
+    refute_predicate backend, :alive?
+  ensure
+    backend&.close
+  end
+
+  def test_signal_on_dead_kernel_raises
+    backend = Repl::Backend.new(fake_kernel, prompt: 'fake> ')
+    backend.close
+    assert_raises(Repl::Error) { backend.signal('INT') }
+  end
+
+  def test_kernel_runs_in_its_own_process_group
+    with_backend(prompt: 'fake> ') do |b|
+      assert_equal b.pid, Process.getpgid(b.pid)
+    end
+  end
+end
+
+class PostTest < Minitest::Test
+  include TestHelpers
+
+  def test_post_does_not_wait_for_output
+    with_backend(prompt: 'fake> ') do |b|
+      assert_equal 'a = 6 * 7', b.post('a = 6 * 7')
+      assert_equal '42', b.execute('a')
+    end
+  end
+
+  def test_answer_of_a_post_is_dropped_by_the_next_command
+    with_backend(prompt: 'fake> ') do |b|
+      b.post('6 * 7')
+      assert_equal '2', b.execute('1 + 1')
+    end
+  end
+
+  def test_post_ignores_blank_input
+    with_backend(prompt: 'fake> ') do |b|
+      assert_equal '', b.post("  \n")
+    end
+  end
+
+  def test_post_on_dead_kernel_raises
+    with_backend(prompt: 'fake> ') do |b|
+      b.close
+      assert_raises(Repl::Error) { b.post('1 + 1') }
+    end
+  end
+
+  def test_post_over_the_socket_is_recorded
+    backend = Repl::Backend.new(fake_kernel, prompt: 'fake> ')
+    server = Repl::Server.new(backend, socket_path: tmp_socket,
+                                       registry: tmp_registry, out: StringIO.new).start
+    assert_equal 'posted', Repl::Client.post(server.socket_path, 'a = 1')
+    assert_equal '1', Repl::Client.call(server.socket_path, 'a')
+    assert_equal 'a = 1', server.history.tail(2).first.input
+  ensure
+    server&.stop
+  end
+
+  def test_post_feeds_a_command_that_is_still_running
+    source = <<~RUBY
+      STDOUT.sync = true
+      while (line = STDIN.gets)
+        puts line.chomp == "read" ? "got: \#{STDIN.gets.to_s.chomp}" : line.chomp
+      end
+    RUBY
+    backend = Repl::Backend.new(fake_kernel(source), idle_timeout: 0.2, wait_timeout: 0.5)
+    server = Repl::Server.new(backend, socket_path: tmp_socket,
+                                       registry: tmp_registry, out: StringIO.new).start
+    asked = Thread.new { Repl::Client.call(server.socket_path, 'read') }
+    sleep 0.3
+    Repl::Client.post(server.socket_path, 'hello')
+    assert_equal 'got: hello', asked.value.strip
+  ensure
+    server&.stop
+  end
+end
+
+class EditorTest < Minitest::Test
+  include TestHelpers
+
+  # Runs the editor pipeline with a kernel stub that labels its answers.
+  def craft(text, &block)
+    block ||= ->(cmd) { "out(#{cmd})" }
+    Repl::Editor.run(text, &block)
+  end
+
+  def test_markdown_fences_are_cut_off_before_feeding_the_kernel
+    sent = []
+    craft("```bash\nrepl_cmd\n```") { |c| sent << c; '' }
+    assert_equal ['repl_cmd'], sent
+    sent.clear
+    craft("```bash\nrepl_cmd") { |c| sent << c; '' }
+    assert_equal ['repl_cmd'], sent
+    sent.clear
+    craft("repl_cmd\n```") { |c| sent << c; '' }
+    assert_equal ['repl_cmd'], sent
+  end
+
+  def test_fences_are_kept_in_the_crafted_output
+    assert_equal "```bash\nls\n#=>\n# out(ls)\n#==\n```", craft("```bash\nls\n```")
+  end
+
+  def test_command_is_echoed_and_output_appended_without_markers
+    assert_equal "1 + 1\n#=>\n# out(1 + 1)\n#==", craft('1 + 1')
+  end
+
+  def test_only_the_last_command_output_without_markers
+    sent = []
+    out = craft("a = 1\nb = 2") { |c| sent << c; 'answer' }
+    assert_equal ["a = 1\nb = 2"], sent
+    assert_equal "a = 1\nb = 2\n#=>\n# answer\n#==", out
+  end
+
+  def test_stale_output_between_markers_is_replaced
+    text = "ls\n#=>\n# README.md  repl  test\n#==\n"
+    assert_equal "ls\n#=>\n# out(ls)\n#==\n", craft(text)
+  end
+
+  def test_multiple_markers_split_the_input_into_commands
+    sent = []
+    text = "ls\n#=>\n# stale\n#==\nls -a\n#=>\n# stale\n#==\n"
+    out = craft(text) { |c| sent << c; "#{c}!" }
+    assert_equal ['ls', 'ls -a'], sent
+    assert_equal "ls\n#=>\n# ls!\n#==\nls -a\n#=>\n# ls -a!\n#==\n", out
+  end
+
+  def test_missing_close_marker_ends_at_the_first_uncommented_line
+    text = "a\n#=>\n# stale\nb\n#=>\n# stale\n"
+    assert_equal "a\n#=>\n# out(a)\n#==\nb\n#=>\n# out(b)\n#==\n", craft(text)
+  end
+
+  def test_every_output_line_is_prefixed_with_a_hash
+    out = craft('ls') { "one\ntwo\n\nthree" }
+    assert_equal "ls\n#=>\n# one\n# two\n#\n# three\n#==", out
+  end
+
+  def test_empty_output_keeps_an_empty_block
+    assert_equal "ls\n#=>\n#==", craft('ls') { '' }
+  end
+
+  def test_code_after_the_last_block_is_run_but_not_shown
+    sent = []
+    out = craft("a = 1\n#=>\n#==\nb = 2\n") { |c| sent << c; 'x' }
+    assert_equal ['a = 1', "b = 2\n"].map(&:strip), sent.map(&:strip)
+    assert_equal "a = 1\n#=>\n# x\n#==\nb = 2\n", out
+  end
+
+  def test_blank_lines_inside_a_block_are_kept_when_close_follows
+    text = "a\n#=>\n# stale\n\n#==\nb\n"
+    assert_equal "a\n#=>\n# out(a)\n#==\nb\n", craft(text)
+  end
+
+  def test_end_to_end_against_a_kernel
+    backend = Repl::Backend.new(fake_kernel, prompt: 'fake> ')
+    server = Repl::Server.new(backend, socket_path: tmp_socket,
+                                       registry: tmp_registry, out: StringIO.new).start
+    out = Repl::Editor.run("a = [1,2,3]\n#=>\n# stale\n#==\na[1]\n#=>\n#==\n") do |cmd|
+      Repl::Client.call(server.socket_path, cmd)
+    end
+    assert_equal "a = [1,2,3]\n#=>\n# [1, 2, 3]\n#==\na[1]\n#=>\n# 2\n#==\n", out
+  ensure
+    server&.stop
   end
 end
 
@@ -347,6 +614,37 @@ class ServerTest < Minitest::Test
   def test_generated_socket_path_matches_readme_shape
     assert_match(%r{/repl-kernel-[A-Z]{7}\z}, Repl::Server.generate_socket_path)
   end
+
+  def test_signal_request_over_the_socket
+    s = start_server
+    assert_match(/sent SIGTSTP to pid #{s.backend.pid}/, Repl::Client.signal(s.socket_path, '^Z'))
+    Repl::Client.signal(s.socket_path, 'CONT')
+    assert_equal '1', Repl::Client.call(s.socket_path, '1')
+  end
+
+  def test_signal_is_recorded_in_history
+    s = start_server
+    Repl::Client.signal(s.socket_path, 'CONT')
+    assert_equal '<signal CONT>', s.history.tail(1).first.input
+  end
+
+  def test_unknown_signal_returns_error
+    s = start_server
+    err = assert_raises(Repl::Error) { Repl::Client.signal(s.socket_path, 'NOPE') }
+    assert_match(/unknown signal 'NOPE'/, err.message)
+  end
+
+  def test_signal_is_not_blocked_by_a_running_command
+    backend = Repl::Backend.new(fake_kernel(SignalTest::BLOCKING_REPL),
+                                wait_timeout: 5.0, idle_timeout: 0.2)
+    @server = Repl::Server.new(backend, socket_path: tmp_socket,
+                                        registry: tmp_registry, out: StringIO.new).start
+    busy = Thread.new { Repl::Client.call(@server.socket_path, 'sleep 30') }
+    sleep 0.7
+    # served while the kernel is busy, i.e. without waiting for the lock
+    assert_match(/sent SIGINT/, Repl::Client.signal(@server.socket_path, '^C'))
+    assert_equal 'interrupted', busy.value
+  end
 end
 
 class AdminConsoleTest < Minitest::Test
@@ -420,6 +718,130 @@ class AdminConsoleTest < Minitest::Test
   def test_run_admin_exits_on_eof
     @server.run_admin(StringIO.new(''))
     refute File.exist?(@server.socket_path)
+  end
+
+  def test_attach_with_argument_runs_one_command
+    text, action = @server.admin_command('attach 6 * 7')
+    assert_nil action
+    assert_equal '42', text
+    assert_equal 1, @server.history.stats[:requests]
+  end
+
+  def test_attach_without_argument_requests_attached_mode
+    text, action = @server.admin_command('attach')
+    assert_nil text
+    assert_equal :attach, action
+  end
+
+  def test_attached_mode_executes_and_detaches
+    @server.run_attached(StringIO.new("a = 21\na * 2\ndetach\n"))
+    assert_match(/21\n/, @out.string)
+    assert_match(/42\n/, @out.string)
+    assert_match(/detached/, @out.string)
+    assert_equal 2, @server.history.stats[:requests]
+    assert_equal 3, @out.string.scan(@server.attach_prompt).size
+  end
+
+  def test_attached_prompt_names_the_kernel
+    assert @server.attach_prompt.start_with?(File.basename(RbConfig.ruby))
+  end
+
+  def test_attached_mode_reports_empty_output_and_ignores_blank_lines
+    backend = Repl::Backend.new([RbConfig.ruby, '-e', TestHelpers::SILENT_REPL],
+                                wait_timeout: 2.0, idle_timeout: 0.2)
+    out = StringIO.new
+    server = Repl::Server.new(backend, socket_path: tmp_socket,
+                                       registry: tmp_registry, out: out).start
+    server.run_attached(StringIO.new("# silent\n\n7\ndetach\n"))
+    assert_match(/no output/, out.string)
+    assert_match(/7\n/, out.string)
+    assert_equal 2, server.history.stats[:requests]
+  ensure
+    server&.stop
+  end
+
+  def test_admin_attach_returns_to_admin_loop
+    @server.run_admin(StringIO.new("attach\n1 + 1\ndetach\nstats\nquit\n"))
+    assert_match(/2\n/, @out.string)
+    assert_match(/requests: 1/, @out.string)
+    refute File.exist?(@server.socket_path)
+  end
+
+  def test_attached_mode_ends_on_eof
+    @server.run_attached(StringIO.new("1 + 1\n"))
+    assert_match(/detached/, @out.string)
+  end
+
+  def test_interrupt_is_only_forwarded_while_attached
+    refute_predicate @server, :attached?
+    refute @server.forward_interrupt, 'outside attached mode the server stops instead'
+  end
+
+  def test_attached_mode_forwards_ctrl_c_to_the_kernel
+    backend = Repl::Backend.new(fake_kernel(SignalTest::BLOCKING_REPL),
+                                wait_timeout: 5.0, idle_timeout: 0.2)
+    out = StringIO.new
+    server = Repl::Server.new(backend, socket_path: tmp_socket,
+                                       registry: tmp_registry, out: out).start
+    reader, writer = IO.pipe
+    attached = Thread.new { server.run_attached(reader) }
+    writer.puts('sleep 30')
+    sleep 0.7
+    assert_predicate server, :attached?
+    assert server.forward_interrupt, 'the interrupt reaches the kernel'
+    writer.puts('detach')
+    attached.join(10)
+    assert_match(/interrupted/, out.string)
+    assert_predicate backend, :alive?
+    refute_predicate server, :attached?
+  ensure
+    writer&.close
+    reader&.close
+    server&.stop
+  end
+
+  def test_forward_interrupt_declines_when_the_kernel_is_dead
+    reader, writer = IO.pipe
+    attached = Thread.new { @server.run_attached(reader) }
+    writer.puts('1 + 1')
+    sleep 0.3
+    @server.admin_command('eof')
+    sleep 0.3
+    refute_predicate @server.backend, :alive?
+    refute @server.forward_interrupt, 'a dead kernel cannot swallow the interrupt'
+  ensure
+    writer&.close
+    attached&.join(5)
+    reader&.close
+  end
+
+  def test_signal_admin_commands
+    # a kernel that survives INT, so all commands can be checked in one go
+    backend = Repl::Backend.new(fake_kernel(TestHelpers::PATIENT_REPL),
+                                wait_timeout: 1.0, idle_timeout: 0.2)
+    server = Repl::Server.new(backend, socket_path: tmp_socket,
+                                       registry: tmp_registry,
+                                       out: StringIO.new).start
+    assert_match(/sent SIGTSTP/, server.admin_command('signal ^Z').first)
+    assert_match(/sent SIGCONT/, server.admin_command('signal CONT').first)
+    assert_match(/sent SIGINT/, server.admin_command('signal').first)
+    assert_match(/sent SIGINT/, server.admin_command('interrupt').first)
+    assert_match(/error: unknown signal 'BOGUS'/, server.admin_command('signal BOGUS').first)
+    assert_predicate backend, :alive?
+  ensure
+    server&.stop
+  end
+
+  def test_eof_admin_command_stops_the_kernel
+    assert_match(/closed kernel input/, @server.admin_command('eof').first)
+    sleep 0.3
+    refute_predicate @server.backend, :alive?
+  end
+
+  def test_help_lists_new_commands
+    help = @server.admin_command('help').first
+    assert_match(/attach/, help)
+    assert_match(/signal/, help)
   end
 end
 
@@ -516,6 +938,77 @@ class CLITest < Minitest::Test
   ensure
     server&.stop
   end
+
+  def test_post_command_end_to_end
+    backend = Repl::Backend.new(fake_kernel, prompt: 'fake> ')
+    server = Repl::Server.new(backend, socket_path: tmp_socket,
+                                       registry: tmp_registry, out: StringIO.new).start
+    code, out, = cli(['post', '--socket', server.socket_path],
+                     stdin: StringIO.new("a = 6 * 7\n"))
+    assert_equal 0, code
+    assert_equal '', out, 'post prints nothing'
+    assert_equal "42\n", cli(['send', '--socket', server.socket_path, 'a'])[1]
+  ensure
+    server&.stop
+  end
+
+  def test_post_with_empty_input
+    code, _out, err = cli(['post'], stdin: StringIO.new("  \n"))
+    assert_equal 1, code
+    assert_match(/nothing to send/, err)
+  end
+
+  def test_editor_send_command_end_to_end
+    backend = Repl::Backend.new(fake_kernel, prompt: 'fake> ')
+    server = Repl::Server.new(backend, socket_path: tmp_socket,
+                                       registry: tmp_registry, out: StringIO.new).start
+    text = "a = [1,2,3]\n#=>\n# stale\n#==\na[1]\n#=>\n#==\n"
+    code, out, = cli(['editor-send', '--socket', server.socket_path],
+                     stdin: StringIO.new(text))
+    assert_equal 0, code
+    assert_equal "a = [1,2,3]\n#=>\n# [1, 2, 3]\n#==\na[1]\n#=>\n# 2\n#==\n", out
+  ensure
+    server&.stop
+  end
+
+  def test_send_post_and_editor_send_accept_help
+    %w[send post editor-send].each do |command|
+      code, out, = cli([command, '--help'])
+      assert_equal 0, code
+      assert_match(/Usage:/, out)
+    end
+  end
+
+  def test_signal_command_end_to_end
+    backend = Repl::Backend.new(fake_kernel, prompt: 'fake> ')
+    server = Repl::Server.new(backend, socket_path: tmp_socket,
+                                       registry: tmp_registry, out: StringIO.new).start
+    code, out, = cli(['signal', '--socket', server.socket_path, '^Z'])
+    assert_equal 0, code
+    assert_match(/sent SIGTSTP/, out)
+    assert_match(/sent SIGCONT/, cli(['signal', '--socket', server.socket_path, 'CONT'])[1])
+    # defaults to INT and finds the server through the registry
+    assert_match(/sent SIGINT/, cli(['signal'])[1])
+  ensure
+    server&.stop
+  end
+
+  def test_signal_command_reports_unknown_signal
+    backend = Repl::Backend.new(fake_kernel, prompt: 'fake> ')
+    server = Repl::Server.new(backend, socket_path: tmp_socket,
+                                       registry: tmp_registry, out: StringIO.new).start
+    code, _out, err = cli(['signal', '--socket', server.socket_path, 'BOGUS'])
+    assert_equal 1, code
+    assert_match(/unknown signal/, err)
+  ensure
+    server&.stop
+  end
+
+  def test_signal_without_server
+    code, _out, err = cli(['signal'])
+    assert_equal 1, code
+    assert_match(/no running server/, err)
+  end
 end
 
 # End-to-end run of the real executable with a real irb kernel.
@@ -542,6 +1035,16 @@ class ExecutableTest < Minitest::Test
     # no --socket: resolved through the registry
     assert_equal '3', run_send(env, nil, 'a.size')
 
+    # a blocking command can be interrupted from another client
+    blocked = Thread.new { run_send(env, socket, 'sleep 60') }
+    sleep 1.5
+    assert_match(/sent SIGINT/, run_cli(env, 'signal', '--socket', socket, '^C'))
+    assert_match(/Abort|Interrupt/, blocked.value)
+    assert_equal '4', run_send(env, socket, '2 + 2')
+
+    # admin console can talk to the kernel directly
+    stdin.puts('attach a.size')
+    assert_match(/3\z/, stdout.readline.strip)
     stdin.puts('stats')
     stdin.puts('quit')
     stdin.close
@@ -553,6 +1056,12 @@ class ExecutableTest < Minitest::Test
   end
 
   private
+
+  def run_cli(env, *args)
+    out, status = Open3.capture2e(env, RbConfig.ruby, BIN, *args)
+    assert_predicate status, :success?, "repl #{args.join(' ')} failed: #{out}"
+    out.strip
+  end
 
   def run_send(env, socket, input)
     args = ['send']
