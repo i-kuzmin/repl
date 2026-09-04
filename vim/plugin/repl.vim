@@ -1,18 +1,18 @@
 " plugin/repl.vim -- commands and key bindings for the `repl` kernel.
 "
 " Filtering (the region is replaced by the crafted answer):
-"   <Leader>rp   paragraph          <Leader>rs   ``` block
-"   <Leader>rm{motion}              <Leader>rp / <Leader>rs on a selection
+"   <Leader>rr   paragraph          <Leader>rR   ``` block
+"   <Leader>rm{motion}              <Leader>rr / <Leader>rR on a selection
 " Posting (nothing is written back):
-"   <Leader>Rp   paragraph          <Leader>Rs   ``` block
-"   <Leader>Rm{motion}              <Leader>Rp / <Leader>Rs on a selection
+"   <Leader>Rr   paragraph          <Leader>RR   ``` block
+"   <Leader>Rm{motion}              <Leader>Rr / <Leader>RR on a selection
 " Clearing (the output blocks are emptied, only '#=>' is kept):
-"   <Leader>rcp  paragraph          <Leader>rcs  ``` block
-"   <Leader>rcm{motion}             <Leader>rc   on a selection
+"   <Leader>rc   paragraph          <Leader>rC   ``` block
+"   <Leader>rM{motion}              <Leader>rc / <Leader>rC on a selection
 "
-" In Visual mode the region is always the selection, so the 'p' and 's' keys
-" lead to the same place; no default binding is a prefix of another one, so
-" nothing has to wait for 'timeout'.
+" The lower case key takes the paragraph, the upper case one the ``` block; in
+" Visual mode both take the selection. No default binding is a prefix of
+" another one, so nothing has to wait for 'timeout'.
 " Set g:repl_no_mappings to keep the <Plug> mappings only, g:repl_command to
 " pick the script and g:repl_socket (or b:repl_socket) to pick the kernel.
 
@@ -63,20 +63,20 @@ function! s:map(mode, lhss, plug) abort
 endfunction
 
 if !get(g:, 'repl_no_mappings', 0)
-  call s:map('n', ['<Leader>rp'], '<Plug>(repl-send-paragraph)')
-  call s:map('n', ['<Leader>rs'], '<Plug>(repl-send-section)')
+  call s:map('n', ['<Leader>rr'], '<Plug>(repl-send-paragraph)')
+  call s:map('n', ['<Leader>rR'], '<Plug>(repl-send-section)')
   call s:map('n', ['<Leader>rm'], '<Plug>(repl-send-operator)')
-  call s:map('x', ['<Leader>rp', '<Leader>rs'], '<Plug>(repl-send)')
+  call s:map('x', ['<Leader>rr', '<Leader>rR'], '<Plug>(repl-send)')
 
-  call s:map('n', ['<Leader>Rp'], '<Plug>(repl-post-paragraph)')
-  call s:map('n', ['<Leader>Rs'], '<Plug>(repl-post-section)')
+  call s:map('n', ['<Leader>Rr'], '<Plug>(repl-post-paragraph)')
+  call s:map('n', ['<Leader>RR'], '<Plug>(repl-post-section)')
   call s:map('n', ['<Leader>Rm'], '<Plug>(repl-post-operator)')
-  call s:map('x', ['<Leader>Rp', '<Leader>Rs'], '<Plug>(repl-post)')
+  call s:map('x', ['<Leader>Rr', '<Leader>RR'], '<Plug>(repl-post)')
 
-  call s:map('n', ['<Leader>rcp'], '<Plug>(repl-clear-paragraph)')
-  call s:map('n', ['<Leader>rcs'], '<Plug>(repl-clear-section)')
-  call s:map('n', ['<Leader>rcm'], '<Plug>(repl-clear-operator)')
-  call s:map('x', ['<Leader>rc'], '<Plug>(repl-clear)')
+  call s:map('n', ['<Leader>rc'], '<Plug>(repl-clear-paragraph)')
+  call s:map('n', ['<Leader>rC'], '<Plug>(repl-clear-section)')
+  call s:map('n', ['<Leader>rM'], '<Plug>(repl-clear-operator)')
+  call s:map('x', ['<Leader>rc', '<Leader>rC'], '<Plug>(repl-clear)')
 endif
 
 let &cpoptions = s:save_cpo

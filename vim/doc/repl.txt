@@ -79,31 +79,33 @@ motion      any motion or text object, through the operator mappings.
 
 Default bindings, filtering: >
 
-    <Leader>rp        paragraph
-    <Leader>rs        ``` block
+    <Leader>rr        paragraph
+    <Leader>rR        ``` block
     <Leader>rm{motion}  the lines covered by {motion}, e.g. <Leader>rmap
-    <Leader>rp        the selection                (Visual mode)
-    <Leader>rs        the selection                (Visual mode)
+    <Leader>rr        the selection                (Visual mode)
+    <Leader>rR        the selection                (Visual mode)
 <
 posting: >
 
-    <Leader>Rp        paragraph
-    <Leader>Rs        ``` block
+    <Leader>Rr        paragraph
+    <Leader>RR        ``` block
     <Leader>Rm{motion}  the lines covered by {motion}
-    <Leader>Rp        the selection                (Visual mode)
-    <Leader>Rs        the selection                (Visual mode)
+    <Leader>Rr        the selection                (Visual mode)
+    <Leader>RR        the selection                (Visual mode)
 <
 and clearing: >
 
-    <Leader>rcp       paragraph
-    <Leader>rcs       ``` block
-    <Leader>rcm{motion}  the lines covered by {motion}
+    <Leader>rc        paragraph
+    <Leader>rC        ``` block
+    <Leader>rM{motion}  the lines covered by {motion}
     <Leader>rc        the selection                (Visual mode)
+    <Leader>rC        the selection                (Visual mode)
 <
-In Visual mode the region is always the selection, so the trailing 'p' and 's'
-lead to the same place; they are kept so that the fingers do not have to know
-which mode they are in. No default binding is the prefix of another one, so
-none of them waits for 'timeout' before firing.
+The lower case key takes the paragraph, the upper case one the ``` block. In
+Visual mode the region is always the selection, so both lead to the same place;
+they are kept so that the fingers do not have to know which mode they are in.
+No default binding is the prefix of another one, so none of them waits for
+'timeout' before firing.
 
 Set |g:repl_no_mappings| and map the |<Plug>| targets yourself: >
 

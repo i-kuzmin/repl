@@ -236,20 +236,19 @@ the directory to the runtime path (`set runtimepath+=~/src/repl/vim`, or point
 your plugin manager at this repo) and start a kernel outside Vim.
 
 Filtering replaces the region with the crafted answer, posting leaves the
-buffer alone, clearing empties the output blocks back to a bare `#=>`:
+buffer alone, clearing empties the output blocks back to a bare `#=>`. The
+three actions share a region and differ only in the key:
 
-| keys | region | action |
-| --- | --- | --- |
-| `<Leader>rp` | paragraph | `editor-send` |
-| `<Leader>rs` | the surrounding ` ``` ` block | `editor-send` |
-| `<Leader>rm{motion}` | the lines of `{motion}` | `editor-send` |
-| `<Leader>rp`, `<Leader>rs` (visual) | the selected lines | `editor-send` |
-| `<Leader>Rp`, `<Leader>Rs`, `<Leader>Rm{motion}`, `<Leader>Rp`/`<Leader>Rs` (visual) | the same regions | `post` |
-| `<Leader>rcp`, `<Leader>rcs`, `<Leader>rcm{motion}`, `<Leader>rc` (visual) | the same regions | clear |
+| keys (send / post / clear) | region |
+| --- | --- |
+| `<Leader>rr` / `<Leader>Rr` / `<Leader>rc` | paragraph |
+| `<Leader>rR` / `<Leader>RR` / `<Leader>rC` | the surrounding ` ``` ` block |
+| `<Leader>rm` / `<Leader>Rm` / `<Leader>rM` + `{motion}` | the lines of `{motion}` |
+| the same keys in visual mode | the selected lines |
 
-In visual mode the region is always the selection, so the trailing `p` and `s`
-lead to the same place; no default binding is the prefix of another one, so
-none of them waits for `timeout`.
+The lower case key takes the paragraph, the upper case one the ` ``` ` block;
+in visual mode both take the selection. No default binding is the prefix of
+another one, so none of them waits for `timeout`.
 
 The same as commands: `:[range]ReplSend`, `:[range]ReplPost`,
 `:[range]ReplClear` (the whole buffer by default), `:ReplSendParagraph`,
@@ -267,3 +266,4 @@ of the `<Plug>(repl-send-...)`, `<Plug>(repl-post-...)` and
 - Intrdocude 'restart' admin command (it should re-run the same kernel) 
 - Fix 'tail' as though it can continiously show updates
 - Backend sometimes hangs. As a results all post/send commands returns with no output
+- make sure post command filters out blocks (#=> ...) before passing command to the kernel

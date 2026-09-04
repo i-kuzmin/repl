@@ -178,10 +178,12 @@ function! repl#clear(first, last) abort
   let l:cleared = 0
   while l:lnum <= l:last
     if getline(l:lnum) =~# s:open
-      let l:end = s:block_end(l:lnum + 1, l:last)
+      " The block belongs to the '#=>' just found, so it is emptied whole even
+      " when the region cuts it in half.
+      let l:end = s:block_end(l:lnum + 1, line('$'))
       if l:end > l:lnum + 1
         call deletebufline('%', l:lnum + 1, l:end - 1)
-        let l:last -= l:end - l:lnum - 1
+        let l:last = max([l:lnum, l:last - (l:end - l:lnum - 1)])
         let l:cleared += 1
       endif
     endif
