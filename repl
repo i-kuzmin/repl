@@ -1,1039 +1,1211 @@
 #!/usr/bin/env ruby
-# frozen_string_literal: true
 
-# repl -- wrap a persistent REPL process and expose it over a UNIX socket.
-#
-#   repl kernel irb          # start a server (admin console on stdin/stdout)
-#   echo 'a = [1,2,3]' | repl send
-#
-# Single-file implementation: everything lives in the Repl module so it can be
-# unit tested by `load`ing this file.
-
-require 'fileutils'
-require 'json'
-require 'open3'
+require 'io/console'
+require 'logger'
 require 'optparse'
-require 'securerandom'
+require 'pty'
 require 'socket'
-require 'tmpdir'
+require 'strscan'
+require 'rbconfig'
 
-module Repl
-  VERSION = '1.0.0'
 
-  DEFAULT_IDLE_TIMEOUT = 0.3   # silence that marks the end of an answer
-  DEFAULT_WAIT_TIMEOUT = 2.0   # how long to wait for the first byte
-  DEFAULT_TIMEOUT      = 30.0  # inactivity limit in prompt/marker mode
-  DEFAULT_HISTORY      = 100
-  MARKER_GRACE         = 0.05  # time given to trailing output after a marker
-  POST_GRACE           = 0.2   # time given to the answer of a `post` nobody read
+module OS
+  def self.mac?
+    !!(RbConfig::CONFIG['host_os'] =~ /mac|darwin/i)
+  end
 
-  # Control characters and friendly names accepted by `repl signal`.
-  SIGNAL_ALIASES = {
-    "\x03" => 'INT',  '^C' => 'INT',  'CTRL-C' => 'INT',  'C-C' => 'INT',
-    "\x1A" => 'TSTP', '^Z' => 'TSTP', 'CTRL-Z' => 'TSTP', 'C-Z' => 'TSTP',
-    "\x1C" => 'QUIT', '^\\' => 'QUIT', 'CTRL-\\' => 'QUIT',
-    "\x04" => 'EOF',  '^D' => 'EOF',  'CTRL-D' => 'EOF',  'C-D' => 'EOF'
-  }.freeze
+  def self.linux?
+    !!(RbConfig::CONFIG['host_os'] =~ /linux/i)
+  end
 
-  # Signals a terminal generates from a keystroke; they are aimed at the
-  # foreground job rather than at the shell that started it.
-  TERMINAL_SIGNALS = %w[INT QUIT TSTP].freeze
+  if mac?
+    TIOCGPGRP = 0x40047477
+  elsif linux?
+    TIOCGPGRP = 0x540F
+  else
+    raise "Unsupported platform"
+  end
+end
 
-  class Error < StandardError; end
+module REPL
 
-  # Wraps the REPL child process. Communication goes over plain pipes (not a
-  # PTY) so that REPLs disable their line editors and emit clean output.
-  class Backend
-    attr_reader :command, :pid, :banner
+VERSION = '1.0.0'
 
-    def initialize(command, idle_timeout: DEFAULT_IDLE_TIMEOUT,
-                   wait_timeout: DEFAULT_WAIT_TIMEOUT, timeout: DEFAULT_TIMEOUT,
-                   prompt: nil, marker: nil)
-      @command = Array(command).map(&:to_s)
-      raise Error, 'kernel command is required' if @command.empty?
+class BasicLogger < Logger
+  def initialize stream
+    super
+    l = ENV.fetch 'REPL_LOGLEVEL', 'WARN'
+    set_level(l) unless l.nil?
+    f = ENV['REPL_LOGFILE']
+    redirect(f) unless f.nil?
+  end
 
-      @idle_timeout = idle_timeout
-      @wait_timeout = wait_timeout
-      @timeout = timeout
-      @prompt = prompt && Regexp.new(prompt)
-      @marker = marker
-      @echo = false # set once the kernel is seen echoing its input
-      @posted = false # true while an unread answer of a `post` may be coming
-      # Own process group, so that signals reach the kernel and its children
-      # without touching the server itself.
-      @stdin, @stdout, @waiter = Open3.popen2e({ 'TERM' => 'dumb' }, *@command, pgroup: true)
-      @pid = @waiter.pid
-      @banner = clean(sync_startup, '', nil)
-    rescue Errno::ENOENT => e
-      raise Error, "cannot start kernel: #{e.message}"
-    end
-
-    def alive?
-      @waiter.alive?
-    end
-
-    # Send one command to the REPL and return its output.
-    def execute(input)
-      raise Error, 'kernel is not running' unless alive?
-
-      command_text = input.to_s.sub(/\n+\z/, '')
-      return '' if command_text.strip.empty?
-
-      # A previous `post` may still be answering; give it time to arrive so
-      # that its output is dropped here and not mixed into this answer.
-      discard_pending(@posted ? POST_GRACE : 0)
-      @posted = false
-      token = @marker ? new_token : nil
-      @stdin.puts(command_text)
-      @stdin.puts(format(@marker, token)) if token
-      @stdin.flush
-      clean(read_answer(token), command_text, token)
-    rescue Errno::EPIPE
-      raise Error, 'kernel has terminated'
-    end
-
-    # Write a command to the kernel without reading its answer. Never waits
-    # for output, so it also works while another command is running (it then
-    # feeds that command's stdin).
-    def post(input)
-      raise Error, 'kernel is not running' unless alive?
-
-      command_text = input.to_s.sub(/\n+\z/, '')
-      return '' if command_text.strip.empty?
-
-      @stdin.puts(command_text)
-      @stdin.flush
-      @posted = true
-      command_text
-    rescue Errno::EPIPE, IOError
-      raise Error, 'kernel has terminated'
-    end
-
-    # Send a signal (or a control character such as "^C") to the kernel.
-    # Never blocks, so it works while a command is still running.
-    def signal(name)
-      signal = self.class.normalize_signal(name)
-      raise Error, 'kernel is not running' unless alive?
-
-      if signal == 'EOF'
-        close_input
-        return 'EOF'
-      end
-      deliver(signal)
-      signal
-    end
-
-    def self.normalize_signal(name)
-      key = name.to_s.strip
-      key = SIGNAL_ALIASES[key] || SIGNAL_ALIASES[key.upcase] || key.upcase
-      key = key.sub(/\ASIG/, '')
-      return key if key == 'EOF' || Signal.list.key?(key)
-
-      raise Error, "unknown signal '#{name}'"
-    end
-
-    def close
-      close_input
-      @waiter.join(1) || (Process.kill('TERM', @pid) rescue nil)
-      @waiter.join(1) || (Process.kill('KILL', @pid) rescue nil)
-      @stdout.close unless @stdout.closed?
-      nil
-    rescue IOError, Errno::ESRCH
-      nil
-    end
-
-    private
-
-    # Terminal-generated signals go to the foreground job, i.e. to the
-    # kernel's own children when it is running one. Shells (bash, sh, ...)
-    # quit when a SIGINT of their own arrives, so hitting the whole process
-    # group would kill the kernel instead of the command it is running.
-    def deliver(signal)
-      if TERMINAL_SIGNALS.include?(signal)
-        job = descendants
-        unless job.empty?
-          job.each { |pid| Process.kill(signal, pid) rescue nil }
-          return
-        end
-      end
-      signal_group(signal)
-    end
-
-    # Signal the whole process group; fall back to the process itself.
-    def signal_group(signal)
-      Process.kill(signal, -@pid)
-    rescue Errno::ESRCH, Errno::EPERM
-      begin
-        Process.kill(signal, @pid)
-      rescue Errno::ESRCH
-        raise Error, 'kernel is not running'
-      end
-    end
-
-    # Every process below the kernel, children first.
-    def descendants
-      children = child_map
-      found = []
-      queue = [@pid]
-      until queue.empty?
-        children[queue.shift].to_a.each do |pid|
-          next if found.include?(pid)
-
-          found << pid
-          queue << pid
-        end
-      end
-      found
-    end
-
-    # pid => [child pid, ...] for every process on the machine.
-    def child_map
-      map = Hash.new { |h, k| h[k] = [] }
-      each_process { |pid, ppid| map[ppid] << pid }
-      map
-    end
-
-    def each_process
-      if File.directory?('/proc/self')
-        each_proc_process { |pid, ppid| yield pid, ppid }
-      else
-        each_ps_process { |pid, ppid| yield pid, ppid }
-      end
-    end
-
-    def each_proc_process
-      Dir.glob('/proc/[0-9]*/stat').each do |path|
-        stat = begin
-          File.read(path)
-        rescue SystemCallError, IOError
-          next
-        end
-        # "pid (comm) state ppid ..." -- comm may contain spaces and ')'.
-        tail = stat[(stat.rindex(') ') || -2) + 2, stat.length].to_s.split
-        pid = File.basename(File.dirname(path)).to_i
-        ppid = tail[1].to_i
-        yield pid, ppid if pid.positive? && ppid.positive?
-      end
-    end
-
-    def each_ps_process
-      out, status = Open3.capture2e('ps', '-eo', 'pid=,ppid=')
-      return unless status.success?
-
-      out.each_line do |line|
-        pid, ppid = line.split.map(&:to_i)
-        yield pid, ppid if pid&.positive? && ppid&.positive?
-      end
-    rescue SystemCallError
-      nil
-    end
-
-    def close_input
-      @stdin.close unless @stdin.closed?
-    rescue IOError
-      nil
-    end
-
-    def new_token
-      "REPL-#{SecureRandom.hex(8)}"
-    end
-
-    # Wait for the kernel to become ready and swallow its banner.
-    def sync_startup
-      if @marker
-        token = new_token
-        @stdin.puts(format(@marker, token))
-        @stdin.flush
-        read_answer(token)
-      elsif @prompt
-        read_answer(nil)
-      else
-        drain(@wait_timeout)
-      end
-    end
-
-    def read_answer(token)
-      if token
-        answer = read_while { |buf| buf.lines.any? { |l| l.strip == token } }
-        discard_pending(MARKER_GRACE) # the marker line's own return value
-        answer
-      elsif @prompt
-        read_while { |buf| @prompt.match?(buf.lines.last.to_s) }
-      else
-        drain(@wait_timeout)
-      end
-    end
-
-    # Throw away output left over from a previous command.
-    def discard_pending(timeout = 0)
-      drain_loop(timeout, timeout) { }
-    end
-
-    # Read until the block says we are done (or the kernel goes quiet for
-    # @timeout seconds).
-    def read_while(&done)
-      buffer = +''
-      drain_loop(@timeout, @timeout) do |chunk|
-        buffer << chunk
-        break if done.call(buffer)
-      end
-      buffer
-    end
-
-    # Read until the kernel is silent for @idle_timeout seconds.
-    def drain(first_wait)
-      buffer = +''
-      drain_loop(first_wait, @idle_timeout) { |chunk| buffer << chunk }
-      buffer
-    end
-
-    def drain_loop(first_wait, next_wait)
-      timeout = first_wait
-      loop do
-        break unless IO.select([@stdout], nil, nil, timeout)
-
-        chunk = read_chunk
-        break if chunk.nil?
-
-        yield chunk
-        timeout = next_wait
-      end
-    end
-
-    def read_chunk
-      @stdout.read_nonblock(4096)
-    rescue IO::WaitReadable
-      ''
-    rescue EOFError, Errno::EIO, IOError
-      nil
-    end
-
-    # Remove terminal noise: echoed input, marker lines and prompts.
-    def clean(raw, command_text, token)
-      lines = raw.to_s.gsub("\r\n", "\n").delete("\r").split("\n", -1)
-      if token
-        stop = lines.index { |l| l.strip == token }
-        lines = lines[0...stop] if stop
-        lines.reject! { |l| l.include?(token) }
-      end
-      lines = lines.map { |l| l.sub(@prompt, '') } if @prompt
-      drop_echo(lines, command_text)
-      lines.shift while lines.first&.strip&.empty?
-      lines.pop while lines.last&.strip&.empty?
-      lines.join("\n")
-    end
-
-    # REPLs reading from a pipe usually echo the input back -- but not all of
-    # them do, so a line is only treated as an echo when the kernel is known to
-    # echo, or when real output follows it.
-    def drop_echo(lines, command_text)
-      command_text.split("\n").each do |sent|
-        sent = sent.strip
-        next if sent.empty?
-
-        first = lines.first&.strip
-        next unless first && (first == sent || first.end_with?(sent))
-        next unless @echo || lines.drop(1).any? { |l| !l.strip.empty? }
-
-        lines.shift
-        @echo = true
-      end
+  def set_level name
+    @level = case name.upcase
+    when 'DEBUG'           then DEBUG
+    when 'INFO'            then INFO
+    when 'WARNING', 'WARN' then WARN
+    when 'FATAL'           then FATAL
+    else
+      raise "Unexpected loglevel name '#{name}'"
     end
   end
 
-  # Input preprocessing and output crafting for `repl editor-send`.
+  def raise msg
+    fatal msg
+    ::Kernel.raise msg
+  end
+
+  def logging_options options, o
+    o.on('-v') { @level -=1 if @level > DEBUG }
+    o.on('-s') { @level +=1 if @level < FATAL }
+    o.on('--logfile PATH') { |v| redirect v; options[:logfile] = v }
+  end
+
+  # Redirects where log lines are written. 'stdout'/'-' route back to
+  # $stdout, anything else is a path opened (and appended to) by Logger
+  # itself.
+  def redirect target
+    reopen(%w[stdout -].include?(target) ? $stdout : target)
+  end
+end
+
+Log = BasicLogger.new STDOUT
+
+class Server
+  ON = true
+  OFF = false
+
+  def initialize kernel,
+ 		input: $stdin,
+        output: $stdout,
+        hide_cursor: true
+
+    @socket = "/tmp/REPL.#{Process.pid}.sock"
+    File.unlink(@socket) if File.exist? @socket
+    @server = UNIXServer.new(@socket)
+	Log.info "Server initialized(#{@socket})"
+    @kernel = kernel
+    @input = input
+    @output = output
+    @cache = {}
+    @hide_cursor = hide_cursor
+    setup_signal_handlers
+  end
+
+
+  def run
+	Log.info "Server started"
+    cursor OFF
+
+    @is_running = true
+
+    loop do
+      break if !@is_running
+      serve ClientRequest.new @server.accept
+    end
+    0
+  rescue Interrupt
+    Log.info "Interrupted"
+  ensure
+    cursor ON
+    File.unlink(@socket) if File.exist? @socket
+	Log.info "Server stopped"
+  end
+
+  private
+  def serve client
+    Log.info "Accepted #{client}"
+    case l = client.gets
+    when /^%send:([0-9]+)$/ 
+      size = $1.to_i
+      client.send_response 'Ok' if size == 0
+      handle_send_request client, client.read(size)
+    when /^%post:([0-9]+)$/ 
+      client.send_response 'Ok' if $1.to_i == 0
+      handle_post_request client, client.read($1.to_i)
+    when /^%show:([0-9]+)?$/
+      handle_show_request(client, $1.nil? ? $1 : $1.to_i)
+    when /^%stop$/
+      handle_stop_request client
+    when /^%set:(\w+)=(.+)$/
+      handle_set_request client, $1, $2
+    else
+      raise "Unknown request '#{l}'"
+    end
+  rescue RuntimeError => e
+      Log.error "#{client}: #{e.message}"
+      client.send_response 'Fail', e.message
+  rescue Errno::EPIPE
+    Log.info "#{client}: gone without reading respnose"
+  ensure
+    client.close
+    Log.info "#{client}: done"
+  end
+
+
+  # Commands are fed one line at a time, so that each answer belongs to a known
+  # command instead of having to be split out of one merged response. A line
+  # that leaves the kernel at a continuation prompt is part of a multi-line
+  # command and produces no answer of its own; the whole block answers when its
+  # last line completes it.
   #
-  # The input is a piece of an editor buffer: possibly wrapped in a markdown
-  # code fence and interleaved with output blocks that open with '#=>' and
-  # close with '#==' (or with the first line that is not a comment). The text
-  # is echoed back with every output block replaced by a fresh answer, so the
-  # editor can substitute the region it fed in with the result.
-  module Editor
-    OPEN  = '#=>'
-    CLOSE = '#=='
-    FENCE = /\A\s*```/.freeze
+  # The answers are concatenated: a request is answered as a whole, so what the
+  # caller gets back is one block of output for everything it sent. Splitting a
+  # buffer into smaller requests is the caller's job (notebook cuts it on
+  # the '#=>' markers), not something decided here.
+  def feed client, input
+    answers = []
+    block = String.new
 
-    # One command plus the flag telling whether its output is shown.
-    Chunk = Struct.new(:code, :block) do
-      def command
-        code.join("\n").strip
+    Terminal.render(input).each_line do |line|
+      line += "\n" unless line.end_with? "\n"
+      block << line
+      Log.info "#{client}: sending to kernel #{line.size} bytes ('#{line}')"
+
+      buffer = @kernel.recive_response_for line
+
+      if @kernel.continued?
+        Log.info "#{client}: incomplete, expecting more input"
+        next
       end
+
+      Log.info "#{client}: response from kernel #{buffer.size} bytes"
+      answers << strip(client, buffer, block)
+      block = String.new
     end
 
-    Document = Struct.new(:head, :chunks, :tail)
-
-    # Parse, run every chunk through the given block, and return the crafted
-    # text.
-    def self.run(text)
-      document = parse(text)
-      outputs = document.chunks.map do |chunk|
-        command = chunk.command
-        command.empty? ? '' : yield(command)
-      end
-      render(document, outputs)
+    unless block.empty?
+      Log.error "#{client}: incomplete command, abandoning"
+      @kernel.abandon
     end
 
-    # Splits the text on '#=>' markers; stale output blocks are dropped. The
-    # markdown fences are kept aside, out of the way of the kernel.
-    def self.parse(text)
-      lines = text.to_s.gsub("\r\n", "\n").delete("\r").split("\n", -1)
-      head, tail = split_fences(lines)
-      chunks = []
+    result = answers.join
+    Log.info "#{client}: '#{result}'"
+    result
+  end
+
+  # Removes what the kernel added around the answer: the request as the line
+  # editor redrew it (Reline/irb do this even with the terminal echo off), the
+  # prompt that ends the answer, and the newline the terminal emits to end the
+  # request itself.
+  def strip client, buffer, echoed
+    if (i = buffer.index(echoed))
+      buffer = buffer[(i + echoed.size)..-1]
+      Log.info "#{client}: stripping echo (new size #{buffer.size} bytes)"
+    end
+    buffer.sub(@kernel.prompt, '').sub(/\A\n+/, '')
+  end
+
+  # Every answer is kept under the id of the request that produced it, so that
+  # a caller which only shows an excerpt (notebook stamps the id into the
+  # '#==' terminator) can ask for the whole of it again with `show`.
+  def handle_send_request client, input
+    answer = feed(client, input)
+    @cache[client.id] = answer
+    @last_id = client.id
+    client.send_response 'Ok', answer
+  end
+
+  def handle_post_request client, input
+    client.send_response 'Ok'
+    client.close
+
+    Log.info "#{client}: posting to kernel"
+    response = feed client, input
+    @cache[client.id] = response
+    @last_id = client.id
+    Log.info "#{client}: caching response #{response.size} bytes"
+  end
+
+  def handle_stop_request client
+    @kernel.stop
+    @is_running = false
+    client.send_response 'Ok'
+  end
+
+  def handle_set_request client, key, value
+    case key
+    when 'loglevel'
+      Log.set_level value
+    when 'output'
+      @kernel.output = value
+    when 'logfile'
+      Log.redirect value
+    else
+      raise "Unknown key '#{key}'"
+    end
+    client.send_response 'Ok'
+  end
+
+  def handle_show_request client, id
+    id = @last_id if id.nil?
+    if id.nil? || (data = @cache[id]).nil?
+      client.send_response 'Fail', "No output for #{id.nil? ? 'last' : id}"
+    else
+      client.send_response 'Ok', data
+    end
+  end
+
+  private
+  def setup_signal_handlers
+    trap('INT')  { @kernel.handle_int_signal }
+    trap('TSTP') { handle_tstp_signal }
+    trap('CONT') { handle_cont_signal }
+  end
+
+  def handle_tstp_signal
+    cursor ON
+    trap('TSTP', "DEFAULT")
+    Process.kill('TSTP', Process.pid)
+  end
+
+  def handle_cont_signal
+    cursor OFF
+    trap('TSTP') { handle_tstp_signal }
+  end
+
+
+  CURSOR_OFF = "\e[?25l"
+  CURSOR_ON = "\e[?25h"
+  def cursor v
+    return unless @hide_cursor
+    @output.print v ? CURSOR_ON : CURSOR_OFF
+  end
+
+end
+
+class Server::ClientRequest
+  @@identifier = 0
+
+  def initialize client
+    @client = client
+    @id = (@@identifier += 1)
+  end
+
+  def gets
+    @client.gets
+  end
+
+  def read n
+    @client.read n
+  end
+
+  def to_s
+    "R#{@id}"
+  end
+
+  def close
+    @client.close
+  end
+
+  def send_response status, data = ''
+    @client.puts "%<#{status}:#{@id}>#{data.size}"
+    @client.write data
+    Log.info "#{self}: #{status} -> '#{data.size}' byte(s)"
+  end
+
+  attr_reader :id
+end
+
+class Server::Socket
+  def initialize path
+    @path = path
+    @pid = $1.to_i if path.match /.+REPL\.([0-9]+)\.sock/
+  end
+
+  def alive
+    return false unless @pid && @pid != 0 && File.exist?(@path)
+
+    Process.kill(0, pid) || true
+
+    rescue Errno::ESRCH
+      # ESRCH means the process does not exist (it's dead)
+      false
+    rescue Errno::EPERM
+      # EPERM means the process exists, but you don't have permission to signal it
+      true
+  end
+
+  def to_s
+    @path
+  end
+
+  def self.list
+    Dir['/tmp/REPL.*.sock'].
+      map {|path| Server::Socket.new path}.
+        filter {|socket| socket.alive }
+  end
+
+  def self.default
+    (l = self.list).size == 1 ? l.first : nil
+  end
+
+  attr_reader :path, :pid
+end
+
+# A PTY stream is not plain text but a sequence of terminal commands: prompts
+# come wrapped into OSC titles, SGR colors and bracketed-paste toggles, and
+# line editors redraw a line by moving the cursor back over it. Deleting those
+# commands concatenates text that was meant to overwrite: Reline's redisplay
+# shows up twice and its width probe stays glued to the prompt. They are
+# executed here instead, against just enough of a terminal to reconstruct what
+# a user would have seen: a single line plus a cursor. Completed lines are
+# appended to the output, vertical moves are approximated by a line break.
+class Terminal
+  OSC = /\e\] [\s\S]*? (?: \a | \e\\ ) /x.freeze     # \e]0;title\a
+  CSI = /\e\[ ([\x30-\x3f]*) [\x20-\x2f]* ([\x40-\x7e]) /x.freeze
+  ESC = /\e [\x20-\x2f]* [\x30-\x7e] /x.freeze       # \e(B, \e=
+  # A sequence cut in half by a read boundary: kept until the rest of it
+  # arrives with the next chunk.
+  PARTIAL = /\e (?: \[ [\x30-\x3f]* [\x20-\x2f]* | \] [^\a\e]* )? \z /x.freeze
+
+  TAB = 4
+
+  def self.render input
+    new.write(input).to_s
+  end
+
+  def initialize
+    @out = String.new
+    @line = String.new
+    @col = 0
+    @pending = String.new
+    @replies = []
+  end
+
+  # Feeds one chunk. Chunks are consumed incrementally: an unfinished escape
+  # sequence is held back rather than re-parsed from the start of the stream,
+  # which also keeps a long output linear instead of quadratic.
+  def write input
+    s = StringScanner.new \
+      (@pending + input.to_s).dup.force_encoding(Encoding::UTF_8).scrub('')
+    @pending = String.new
+
+    until s.eos?
+      if s.scan(CSI)
+        command s[2], (s[1].empty? ? nil : s[1].to_i)
+      elsif s.scan(PARTIAL)
+        @pending = s[0]                 # wait for the rest of the sequence
+      elsif s.scan(OSC) || s.scan(ESC)
+        next # carries no text
+      else
+        put s.getch
+      end
+    end
+    self
+  end
+
+  # What has to be sent back to the kernel, once per request. Line editors ask
+  # the terminal where the cursor is and block until they get the answer;
+  # behind a PTY *we* are the terminal, so an unanswered request stops the
+  # kernel before it ever prints its prompt. Reline asks at startup (to measure
+  # character width) and again on every redraw.
+  def replies
+    @replies.slice!(0..)
+  end
+
+  def to_s
+    @out + @line
+  end
+
+  private
+  def command final, arg
+    case final
+    when 'G' then @col = [(arg || 1) - 1, 0].max          # cursor to column
+    when 'C' then @col += (arg || 1)                      # cursor right
+    when 'D' then @col = [@col - (arg || 1), 0].max       # cursor left
+    when 'B' then (arg || 1).times { newline }            # cursor down
+    when 'K' then erase(arg || 0)                         # erase in line
+    when 'n' then report arg                              # status request
+    end
+  end
+
+  # Device Status Report: 6 asks for the cursor position. Only one line is
+  # modelled, hence row 1; the column is reported as the editor would see it.
+  def report arg
+    return unless arg == 6
+    @replies << "\e[1;#{@col + 1}R"
+  end
+
+  def put ch
+    case ch
+    when "\n" then newline
+    when "\r" then @col = 0
+    when "\b" then @col -= 1 if @col > 0
+    when "\t" then @col = ((@col / TAB) + 1) * TAB
+    else
+      return if ch.ord < 0x20 || ch.ord == 0x7f  # remaining control chars
+      pad
+      @line[@col] = ch
+      @col += 1
+    end
+  end
+
+  def newline
+    @out << @line << "\n"
+    @line = String.new
+    @col = 0
+  end
+
+  def erase mode
+    case mode
+    when 0 then @line = @line[0, @col] || @line   # cursor to end of line
+    when 1 then pad; @line[0, @col] = ' ' * @col  # start of line to cursor
+    when 2 then @line = String.new
+    end
+  end
+
+  def pad
+    @line << ' ' * (@col - @line.size) if @col > @line.size
+  end
+end
+
+class Kernel
+  # The prompt is unknown only until the kernel has printed it once: at startup
+  # the banner is read until the kernel stays silent for BANNER_IDLE seconds.
+  # Nothing is running at that point, so a timeout is safe here (and here only).
+  # BANNER_WAIT is the grace given while the kernel is still expected to speak:
+  # before it has said anything (irb needs seconds to boot) and right after a
+  # cursor position request has been answered.
+  BANNER_IDLE = 0.3
+  BANNER_WAIT = 10
+
+  def initialize cmd,
+        prompt: nil,
+        output: $stdout,
+        silent: false
+    @cmd = cmd
+    @silent = silent
+    @prompt = prompt
+    self.output = output
+
+	Log.info "Kernel '#{cmd}' initialized (prompt: #{@prompt.inspect}, output: #{@output.inspect})"
+  end
+
+  # Where the kernel echoes what it reads while a client is connected. Accepts
+  # either an IO already open for writing or a path; 'stdout'/'-' route back
+  # to $stdout, anything else is opened (and appended to, so a repeated
+  # redirect to the same file does not lose earlier output). A file this
+  # method opened itself is closed before switching away from it, so
+  # redirecting output repeatedly does not leak file descriptors.
+  def output= target
+    opens_file = target.is_a?(String) && !%w[stdout -].include?(target)
+    stream = target.is_a?(String) ? self.class.resolve_output(target) : target
+    @output.close if @owns_output && @output && !@output.closed?
+    @owns_output = opens_file
+    @output = stream
+  end
+
+  attr_reader :output
+
+  def self.resolve_output path
+    return $stdout if %w[stdout -].include? path
+    # Unbuffered, so a file being tailed shows output as it happens rather
+    # than whenever Ruby's internal buffer happens to flush.
+    File.open(path, 'a').tap { |f| f.sync = true }
+  end
+
+  def start
+    @in, @out, @pid = PTY.spawn(*@cmd)
+    # The echo in a response is not the kernel repeating the request but the
+    # terminal line discipline reflecting every byte written to the PTY. It is
+    # switched off at the source, before the kernel has printed anything, so
+    # that a response contains output only and no guessing is needed to tell
+    # the two apart.
+    @in.echo = false
+    # PTY.spawn puts the kernel in a session of its own, so this is also the
+    # process group that owns the terminal whenever the kernel itself is the
+    # one reading from it.
+    @pgid = Process.getpgid(@pid) rescue @pid
+	Log.info "Kernel started #{@pid}"
+    banner = recive_response
+    @prompt ||= Kernel.detect_prompt(banner)
+    Log.raise "Can't determine prompt, use --prompt REGEX" unless @prompt
+    Log.info "Prompt detected: #{@prompt.inspect}"
+    true
+  rescue PTY::ChildExited
+    Log.error 'Kernel terminated'
+    false
+  end
+
+  def stop
+    @in.close
+    @out.close
+  end
+
+  def send data
+    @out.write data
+    #@output.print data unless @silent
+  end
+
+  # How long the kernel has to stay quiet before an unfinished line is taken
+  # for a prompt rather than for output it is still in the middle of writing.
+  IDLE = 0.05
+
+  # Reads one answer. It ends either at the prompt the kernel printed at
+  # startup - the command is done - or at any *other* prompt, which means the
+  # kernel is waiting for the rest of a multi-line command (see #continued?).
+  def recive_response
+    screen = Terminal.new
+    @continued = false
+    expecting = true
+    loop do
+      # Only the startup banner is terminated by plain silence; afterwards a
+      # lull is inspected rather than trusted, as a command may take any time.
+      timeout = @prompt ? IDLE : (expecting ? BANNER_WAIT : BANNER_IDLE)
+      if IO.select([@in], nil, nil, timeout).nil?
+        break if @prompt.nil?
+        # Continuation prompts differ per kernel and per construct (bash '> ',
+        # irb '...002* ' for a block but '...006" ' inside a string), so they
+        # are not matched by shape. What they have in common is where they
+        # leave the cursor: a kernel that waits for input has written an
+        # unfinished line, while one that is still working has not.
+        text = screen.to_s
+        next if text.empty? || text.end_with?("\n")
+        @continued = true
+        break
+      end
+
+      chunk = @in.readpartial(4096)
+      break if chunk.nil? || chunk.empty?
+      @output.print chunk unless @silent
+
+      screen.write chunk
+      # A kernel that asked the terminal something still has to print its
+      # prompt, so silence after the answer must not be taken for the end.
+      expecting = answer(screen)
+
+      break if @prompt&.match(screen.to_s)
+    end
+    screen.to_s
+  end
+
+  # True when the last answer stopped at a continuation prompt, i.e. the
+  # command sent so far is incomplete and the kernel expects another line.
+  def continued?
+    @continued
+  end
+
+  # Abandons a half-typed command, returning the kernel to its normal prompt.
+  #
+  # What is in the way decides how it has to go. The terminal knows which
+  # process group it currently belongs to, and that tells the two cases apart
+  # without having to guess: while the kernel is waiting for the rest of a
+  # multi-line command it owns the terminal itself, and an interrupt is what
+  # ends that; when it has started something else - a pager on `man`, an
+  # editor, anything reading from the terminal - that program owns it instead,
+  # and is signalled directly. Signals do not depend on knowing which keystroke
+  # the program in front happens to answer to ('q' ends a pager but types a
+  # character into vim, and nothing ends a plain `cat`).
+  INTERRUPT = "\x03"
+
+  # Sent in this order: SIGTERM first, because a program that handles it puts
+  # the terminal back as it found it on the way out, SIGKILL only for one that
+  # does not go.
+  SIGNALS = %w[TERM KILL].freeze
+
+  # How long a signalled program is given to disappear before the next signal.
+  REAP_TIMEOUT = 1.0
+  REAP_POLL = 0.02
+
+  def abandon
+    pgid = foreground_pgid
+
+    if pgid.nil? || pgid == @pgid
+      send INTERRUPT
+    else
+      kill_group pgid
+    end
+
+    recive_response
+    # A program that was killed outright never got to restore the terminal it
+    # had switched to raw mode, so the one setting the kernel is read with is
+    # asserted again.
+    @in.echo = false
+    Log.error "Kernel still not at its prompt after abandon" if continued?
+  end
+
+  # The process group the terminal currently belongs to: the kernel's own while
+  # it is the one reading, that of the program it started while that program is
+  # in front.
+  def foreground_pgid
+    buffer = [0].pack('i')
+    @in.ioctl(OS::TIOCGPGRP, buffer)
+    pgid = buffer.unpack1('i')
+    # A group of 0 or less is no group at all, and passing it on would send the
+    # signal to the caller's own process group.
+    pgid > 0 ? pgid : nil
+  rescue SystemCallError => e
+    Log.info "Can't read foreground process group: #{e.message}"
+    nil
+  end
+
+  # Signals the whole group, not just its leader: `man` is the parent of the
+  # pager it opened and both have to go.
+  def kill_group pgid
+    SIGNALS.each do |signal|
+      Log.info "Signalling foreground process group #{pgid} with SIG#{signal}"
+      begin
+        Process.kill signal, -pgid
+      rescue Errno::ESRCH, Errno::EPERM
+        return true
+      rescue SystemCallError => e
+        Log.error "Can't signal process group #{pgid}: #{e.message}"
+        return false
+      end
+      return true if reaped? pgid
+      Log.info "Process group #{pgid} survived SIG#{signal}"
+    end
+    false
+  end
+
+  private
+  def reaped? pgid
+    deadline = Time.now + REAP_TIMEOUT
+    loop do
+      return true if reaped_now? pgid
+      return false if Time.now >= deadline
+      sleep REAP_POLL
+    end
+  end
+
+  # Nothing is left in the group to signal: either it is gone, or what remains
+  # of it has already exited and is only waiting to be reaped - which is
+  # reported as a signal that may not be sent rather than as a missing process.
+  # Neither state is changed by signalling it again.
+  def reaped_now? pgid
+    Process.kill 0, -pgid
+    false
+  rescue Errno::ESRCH, Errno::EPERM
+    true
+  end
+
+  public
+  def answer screen
+    screen.replies.each do |reply|
+      Log.info "Answering terminal request with #{reply.inspect}"
+      @out.write reply
+    end.any?
+  end
+
+  def handle_int_signal
+    now = Time.now
+    if @last_signal && now - @last_signal < 2
+      @output.puts "- Two in a row. Terminating...."
+      trap('INT', "DEFAULT")
+      Process.kill('INT', Process.pid)
+      return
+    end
+
+    @last_signal = now
+
+    pgid = foreground_pgid
+    return if pgid.nil?
+    Process.kill 'INT', -pgid
+    @output.puts "^C - passing to child" unless @silent
+  end
+
+  # The prompt is the last (incomplete) line the kernel printed. Digit runs are
+  # generalized so that counters like 'irb(main):001>' keep matching. It is
+  # deliberately not anchored to a line start: output that ends without a
+  # newline (e.g. printf) leaves the prompt glued to it, and a prompt that
+  # cannot be recognized there would never end the response.
+  private
+  def self.detect_prompt banner
+    line = banner.to_s[/[^\n]*\z/]
+    return nil if line.nil? || line.strip.empty?
+    Regexp.new(Regexp.escape(line).gsub(/[0-9]+/, '[0-9]+') + '\z')
+  end
+
+
+  public
+  # Sends one line and reads the answer it produces.
+  def recive_response_for line
+    send line
+    recive_response
+  end
+
+  attr_reader :pid, :prompt
+end
+
+# The buffer as `notebook` sees it: some code, and after it output blocks
+# that the previous answer left behind. Parsing keeps the text a user typed
+# (fences, markers, indentation) apart from the code the kernel has to run and
+# from the stale answers, which are dropped; rendering puts the same text back
+# with fresh answers in place of the old ones.
+#
+#   ```bash        <- fence: echoed back, hidden from the kernel
+#   a = [1,2,3]    <- code of the first command
+#   #=>            <- output block opener
+#   # stale        <- previous answer, dropped
+#   #==[45]        <- terminator, stamped with the id of the answer
+#   ```
+class Notebook
+  FENCE   = /\A\s*```/.freeze
+  OPEN    = /\A(\s*)#=>\s*\z/.freeze
+  CLOSE   = /\A\s*#==(\[[0-9]+\])?\s*\z/.freeze
+  COMMENT = /\A\s*#/.freeze
+  BLANK   = /\A\s*\z/.freeze
+
+  # One command and the block that shows its answer. `opener`/`terminator` are
+  # the lines as they were written (nil when this block has to be created).
+  class Command
+    def initialize lines, opener: nil, terminator: nil
+      @lines = lines
+      @opener = opener
+      @terminator = terminator
+      @output = nil
+      @id = nil
+    end
+
+    def blank?
+      @lines.all? { |l| l =~ BLANK }
+    end
+
+    # What goes to the kernel: the lines as typed, newline terminated.
+    def code
+      @lines.map { |l| "#{l}\n" }.join
+    end
+
+    def render
+      indent = (@opener || '')[/\A\s*/]
+      lines = @lines.dup
+      lines << "#{indent}#=>"
+      lines.concat output_lines(indent)
+      lines << terminator_line(indent)
+      lines
+    end
+
+    attr_reader :lines
+    attr_accessor :output, :id
+
+    private
+    # The id of the answer travels back in the terminator ('#==[45]'), which is
+    # what `show 45` takes to hand out the whole of it. A block that was not
+    # run keeps the terminator as it was written.
+    def terminator_line indent
+      return "#{indent}#==[#{@id}]" unless @id.nil?
+      @terminator || "#{indent}#=="
+    end
+
+    def output_lines indent
+      text = @output.to_s.gsub("\r\n", "\n").gsub("\r", '')
+      text.split("\n", -1).
+        tap { |l| l.pop while !l.empty? && l.last =~ BLANK }.
+        map { |l| l.empty? ? "#{indent}#" : "#{indent}# #{l}" }
+    end
+  end
+
+  def self.parse input
+    new input
+  end
+
+  def initialize input
+    lines = input.to_s.split("\n", -1)
+    lines.pop if lines.last == ''      # the newline that ends the last line
+
+    @prologue, body, @epilogue = split_fences lines
+    @commands, @tail = split_blocks body
+  end
+
+  # The buffer as it has to be written back.
+  def render
+    (@prologue + @commands.flat_map(&:render) + @tail + @epilogue).
+      map { |l| "#{l}\n" }.join
+  end
+
+  attr_reader :commands
+
+  private
+  # A markdown code section is echoed with its fences, but neither the fences
+  # nor what surrounds them (a heading before, prose after) reaches the kernel.
+  # A selection often holds just one of the two fences: it opens the section
+  # when code follows it, and closes it otherwise.
+  def split_fences lines
+    fences = lines.each_index.select { |i| lines[i] =~ FENCE }
+    return [[], lines, []] if fences.empty?
+
+    open, close = fences
+    if close.nil?
+      code_follows = (lines[(open + 1)..] || []).any? { |l| l !~ BLANK }
+      close, open = open, nil unless code_follows
+    end
+
+    head = open.nil? ? [] : lines[0..open]
+    body = lines[((open || -1) + 1)...(close || lines.size)] || []
+    tail = close.nil? ? [] : lines[close..]
+
+    [head, body, tail]
+  end
+
+  # Splits the body on the '#=>' markers: each of them ends the command that
+  # precedes it and owns the stale answer that follows it. Code left after the
+  # last marker (or a body without any marker at all) gets a block of its own,
+  # so that it too shows its answer.
+  def split_blocks body
+    commands = []
+    code = []
+    i = 0
+
+    while i < body.size
+      unless (m = OPEN.match body[i])
+        code << body[i]
+        i += 1
+        next
+      end
+
+      opener = body[i]
+      i, terminator = skip_stale_output body, i + 1
+      commands << Command.new(code, opener: opener, terminator: terminator)
       code = []
-      index = 0
-      while index < lines.size
-        if lines[index].strip == OPEN
-          index = skip_block(lines, index + 1)
-          chunks << Chunk.new(code, true)
-          code = []
-        else
-          code << lines[index]
-          index += 1
-        end
+    end
+
+    if code.any? { |l| l !~ BLANK }
+      commands << Command.new(code)
+      code = []
+    end
+
+    [commands, code]
+  end
+
+  # The stale answer: comment lines up to a '#==' terminator, or up to the
+  # first line that is not a comment. A blank line ends the block, unless a
+  # '#==' still follows it.
+  def skip_stale_output body, i
+    while i < body.size
+      line = body[i]
+      return [i + 1, line] if line =~ CLOSE
+
+      if line =~ BLANK
+        j = i
+        j += 1 while j < body.size && body[j] =~ BLANK
+        return [j + 1, body[j]] if j < body.size && body[j] =~ CLOSE
+        return [i, nil]
       end
-      chunks << Chunk.new(code, false) unless code.empty? && !chunks.empty?
-      chunks << Chunk.new([], true) if chunks.empty?
-      # Without any marker the answer of the last (only) command is appended.
-      chunks.last.block = true if chunks.none?(&:block)
-      Document.new(head, chunks, tail)
+
+      return [i, nil] unless line =~ COMMENT
+      i += 1
     end
+    [i, nil]
+  end
+end
 
-    def self.render(document, outputs)
-      lines = document.head.dup
-      document.chunks.each_with_index do |chunk, i|
-        code = chunk.code.dup
-        # Blank lines at the end of the code belong after the block.
-        blanks = chunk.block ? pop_blanks(code) : []
-        lines.concat(code)
-        lines.concat(block(outputs[i])) if chunk.block
-        lines.concat(blanks)
-      end
-      lines.concat(document.tail)
-      lines.join("\n")
-    end
+class Client
+  def initialize \
+        socket: nil,
+        echo: false,
+ 		input: $stdin,
+        output: $stdout
 
-    def self.pop_blanks(code)
-      blanks = []
-      blanks.unshift(code.pop) while !code.empty? && code.last.strip.empty?
-      blanks
-    end
+    Log.raise "ERR: Can't determine socket" unless socket
 
-    # An output block: the markers plus the answer, one '# ' per line.
-    def self.block(output)
-      [OPEN, *comment(output), CLOSE]
-    end
+    @socket_path = socket.path
+    @server_pid = socket.pid
+	@input = input
+	@output = output
+    @echo = echo
 
-    def self.comment(output)
-      output.to_s.split("\n").map { |line| line.empty? ? '#' : "# #{line}" }
-    end
+    setup_signal_handlers
 
-    # Take a leading and/or trailing markdown fence off the code.
-    def self.split_fences(lines)
-      head = []
-      tail = []
-      first = lines.index { |l| !l.strip.empty? }
-      head = lines.shift(first + 1) if first && FENCE.match?(lines[first])
-      last = lines.rindex { |l| !l.strip.empty? }
-      tail = lines.slice!(last..-1) if last && FENCE.match?(lines[last])
-      [head, tail]
-    end
+    Log.info "Client initialized (#{socket})"
+  end
 
-    # Skip the previous output of a block, i.e. comment lines up to a '#=='
-    # terminator or up to the first line that is not a comment.
-    def self.skip_block(lines, index)
-      while index < lines.size
-        line = lines[index].strip
-        return index + 1 if line == CLOSE
-        return index unless line.start_with?('#') || line.empty?
-
-        # Blank lines belong to the block only when '#==' still follows.
-        if line.empty?
-          nxt = index
-          nxt += 1 while nxt < lines.size && lines[nxt].strip.empty?
-          return lines[nxt]&.strip == CLOSE ? nxt + 1 : index
-        end
-        index += 1
-      end
-      index
+  def post_request
+    request do
+      data = @input.read
+      @socket.puts "%post:#{data.size}"
+      @socket.write data
+      Log.info "sent: #{data.size}"
     end
   end
 
-  # Ring buffer of recent exchanges plus traffic counters.
-  class History
-    Entry = Struct.new(:time, :input, :output)
-
-    attr_reader :limit, :started_at
-
-    def initialize(limit = DEFAULT_HISTORY)
-      @limit = limit
-      @entries = []
-      @requests = 0
-      @in_bytes = 0
-      @out_bytes = 0
-      @started_at = Time.now
-      @mutex = Mutex.new
-    end
-
-    def record(input, output)
-      @mutex.synchronize do
-        @entries << Entry.new(Time.now, input.to_s, output.to_s)
-        @entries.shift while @entries.size > @limit
-        @requests += 1
-        @in_bytes += input.to_s.bytesize
-        @out_bytes += output.to_s.bytesize
-      end
-    end
-
-    def size
-      @mutex.synchronize { @entries.size }
-    end
-
-    def tail(count = 10)
-      @mutex.synchronize { @entries.last([count, 0].max) }
-    end
-
-    def stats
-      @mutex.synchronize do
-        { requests: @requests, in_bytes: @in_bytes, out_bytes: @out_bytes,
-          stored: @entries.size, started_at: @started_at,
-          uptime: Time.now - @started_at }
-      end
+  def send_request
+    request do
+      data = @input.read
+      @socket.puts "%send:#{data.size}"
+      @socket.write data
+      Log.info "sent: #{data.size}"
     end
   end
 
-  # Keeps track of running servers so that `repl send` needs no arguments when
-  # there is only one of them.
-  class Registry
-    def initialize(path = self.class.default_path)
-      @path = path
-    end
-
-    attr_reader :path
-
-    def self.default_path
-      home = ENV['REPL_HOME'] || File.join(Dir.home, '.repl')
-      File.join(home, 'servers.json')
-    end
-
-    def register(socket:, pid:, command:)
-      update do |entries|
-        entries.reject! { |e| e['socket'] == socket }
-        entries << { 'socket' => socket, 'pid' => pid,
-                     'command' => Array(command).join(' '),
-                     'started_at' => Time.now.to_i }
-      end
-    end
-
-    def unregister(socket)
-      update { |entries| entries.reject! { |e| e['socket'] == socket } }
-    end
-
-    # Live servers only; stale entries are pruned on read.
-    def servers
-      update { |entries| entries.select! { |e| live?(e) } }
-    end
-
-    private
-
-    def live?(entry)
-      return false unless File.socket?(entry['socket'].to_s)
-
-      Process.kill(0, entry['pid'].to_i)
-      true
-    rescue Errno::ESRCH, Errno::EPERM, TypeError
-      false
-    end
-
-    def update
-      FileUtils.mkdir_p(File.dirname(@path))
-      File.open(@path, File::RDWR | File::CREAT, 0o600) do |f|
-        f.flock(File::LOCK_EX)
-        entries = JSON.parse(f.read) rescue []
-        entries = [] unless entries.is_a?(Array)
-        yield entries
-        f.rewind
-        f.truncate(0)
-        f.write(JSON.pretty_generate(entries))
-        entries
-      end
+  def stop_request
+    request do
+      Log.info "Sending stop request"
+      @socket.puts "%stop"
     end
   end
 
-  # Sends a single request to a server and returns its output.
-  class Client
-    def self.call(socket_path, input)
-      request(socket_path, 'cmd' => input.to_s)
-    end
-
-    def self.post(socket_path, input)
-      request(socket_path, 'post' => input.to_s)
-    end
-
-    def self.signal(socket_path, name)
-      request(socket_path, 'signal' => name.to_s)
-    end
-
-    def self.request(socket_path, payload)
-      raise Error, "no server socket at '#{socket_path}'" unless File.socket?(socket_path.to_s)
-
-      UNIXSocket.open(socket_path) do |sock|
-        sock.puts(JSON.generate(payload))
-        line = sock.gets
-        raise Error, 'server closed the connection without answering' unless line
-
-        response = JSON.parse(line)
-        raise Error, response['error'] if response['error']
-
-        response['out'].to_s
-      end
-    rescue Errno::ECONNREFUSED, Errno::ENOENT
-      raise Error, "cannot connect to '#{socket_path}'"
+  def set_request val
+    raise "ERR: Value to set is required" if val.nil?
+    raise "ERR: '#{val}' has wrong format" unless /\A(\w+)=(.+)\z/.match val
+    request do
+      Log.info "Sending set #{val}"
+      @socket.puts "%set:#{$1}=#{$2}"
     end
   end
 
-  # Accepts client connections on a UNIX socket and serves the admin console.
-  class Server
-    ADMIN_HELP = <<~HELP.freeze
-      admin commands:
-        tail [n]          show latest messages (default 10)
-        stats             show input/output statistics
-        post COMMAND      send COMMAND to the kernel without waiting for output
-        attach [COMMAND]  talk to the kernel: run COMMAND once, or without
-                          arguments enter attached mode ('detach' to leave;
-                          Ctrl-C is forwarded to the kernel)
-        signal [NAME]     send a signal or control character to the kernel
-                          (default INT); e.g. signal ^C, signal TSTP
-        interrupt         alias for `signal INT`
-        eof               close the kernel's input (Ctrl-D)
-        close, quit       stop the server
-        help              this text
-    HELP
-
-    attr_reader :socket_path, :history, :backend
-
-    def initialize(backend, socket_path: nil, registry: Registry.new,
-                   history: History.new, out: $stdout, prompt: '> ')
-      @backend = backend
-      @socket_path = socket_path || self.class.generate_socket_path
-      @registry = registry
-      @history = history
-      @out = out
-      @prompt = prompt
-      @mutex = Mutex.new
-      @running = false
-      @stopped = false
-      @attached = false
-    end
-
-    def self.generate_socket_path
-      name = (0...7).map { ('A'..'Z').to_a.sample }.join
-      File.join(Dir.tmpdir, "repl-kernel-#{name}")
-    end
-
-    def start
-      FileUtils.rm_f(@socket_path)
-      FileUtils.mkdir_p(File.dirname(@socket_path))
-      @server = UNIXServer.new(@socket_path)
-      File.chmod(0o600, @socket_path)
-      @registry.register(socket: @socket_path, pid: Process.pid,
-                         command: @backend.command)
-      @running = true
-      @acceptor = Thread.new { accept_loop }
-      self
-    end
-
-    def running?
-      @running
-    end
-
-    def stop
-      return self if @stopped
-
-      @stopped = true
-      @running = false
-      begin
-        @server&.close
-      rescue IOError
-        nil
-      end
-      @acceptor&.join(1)
-      FileUtils.rm_f(@socket_path)
-      @registry.unregister(@socket_path)
-      @backend.close
-      self
-    end
-
-    # Runs the admin console; returns when the user asks the server to stop.
-    def run_admin(input = $stdin)
-      loop do
-        @out.print(@prompt)
-        @out.flush
-        line = input.gets
-        break unless line
-
-        text, action = admin_command(line)
-        @out.puts(text) if text
-        break if action == :stop
-        run_attached(input) if action == :attach
-      end
-      stop
-    end
-
-    # Attached mode: every line goes to the kernel until 'detach' or EOF.
-    def run_attached(input = $stdin)
-      @attached = true
-      loop do
-        @out.print(attach_prompt)
-        @out.flush
-        line = input.gets
-        break unless line
-
-        break if %w[detach .].include?(line.strip)
-        next if line.strip.empty?
-
-        @out.puts(run_kernel_command(line))
-      end
-      @out.puts('detached')
-    ensure
-      @attached = false
-    end
-
-    def attached?
-      @attached
-    end
-
-    # In attached mode the console stands in for the kernel's terminal, so
-    # Ctrl-C must reach the kernel instead of stopping the server. Returns
-    # true when the interrupt was forwarded. Runs in a signal handler, so it
-    # must stay lock free (no history recording).
-    def forward_interrupt
-      return false unless @attached && @backend.alive?
-
-      @backend.signal('INT')
-      true
-    rescue Error, SystemCallError
-      false
-    end
-
-    def attach_prompt
-      "#{File.basename(@backend.command.first)}#{@prompt}"
-    end
-
-    # Returns [output, action] where action is nil, :stop or :attach.
-    def admin_command(line)
-      name, arg = line.to_s.strip.split(/\s+/, 2)
-      case name
-      when nil, '' then [nil, nil]
-      when 'close', 'quit', 'exit' then ['stopping', :stop]
-      when 'stats' then [format_stats, nil]
-      when 'tail' then [format_tail(arg.nil? ? 10 : arg.to_i), nil]
-      when 'post' then [safely { post(arg.to_s) }, nil]
-      when 'attach' then arg ? [run_kernel_command(arg), nil] : [nil, :attach]
-      when 'signal' then [safely { signal(arg || 'INT') }, nil]
-      when 'interrupt', 'int' then [safely { signal('INT') }, nil]
-      when 'eof' then [safely { signal('EOF') }, nil]
-      when 'help', '?' then [ADMIN_HELP, nil]
-      else ["unknown command '#{name}' (try help)", nil]
-      end
-    end
-
-    # Executes a command on the kernel and records it. Safe to call from
-    # several connection threads.
-    def execute(input)
-      output = @mutex.synchronize { @backend.execute(input) }
-      @history.record(input, output)
-      output
-    end
-
-    # Signals are delivered without taking the kernel lock, so they can
-    # interrupt a command that is still running.
-    # Posts go straight to the kernel's input without taking the kernel lock,
-    # so they never wait for an answer and can also feed a command that is
-    # still running.
-    def post(input)
-      @backend.post(input)
-      text = 'posted'
-      @history.record(input, text)
-      text
-    end
-
-    def signal(name)
-      sent = @backend.signal(name)
-      text = sent == 'EOF' ? 'closed kernel input (EOF)' : "sent SIG#{sent} to pid #{@backend.pid}"
-      @history.record("<signal #{name}>", text)
-      text
-    end
-
-    private
-
-    def run_kernel_command(line)
-      output = execute(line)
-      output.empty? ? '(no output)' : output
-    rescue Error => e
-      "error: #{e.message}"
-    end
-
-    def safely
-      yield
-    rescue Error => e
-      "error: #{e.message}"
-    end
-
-    def accept_loop
-      while @running
-        begin
-          conn = @server.accept
-        rescue IOError, Errno::EBADF, Errno::EINVAL
-          break
-        end
-        Thread.new(conn) { |c| serve(c) }
-      end
-    end
-
-    def serve(conn)
-      while (line = conn.gets)
-        conn.puts(JSON.generate(handle_request(line)))
-      end
-    rescue Errno::EPIPE, IOError
-      nil
-    ensure
-      begin
-        conn.close
-      rescue IOError
-        nil
-      end
-    end
-
-    def handle_request(line)
-      request = JSON.parse(line)
-      raise Error, 'malformed request: not an object' unless request.is_a?(Hash)
-
-      if request.key?('cmd')
-        { 'out' => execute(request['cmd']) }
-      elsif request.key?('post')
-        { 'out' => post(request['post']) }
-      elsif request.key?('signal')
-        { 'out' => signal(request['signal']) }
-      else
-        raise Error, 'malformed request: "cmd" is missing'
-      end
-    rescue JSON::ParserError
-      { 'error' => 'malformed request: invalid JSON' }
-    rescue Error => e
-      { 'error' => e.message }
-    end
-
-    def format_stats
-      s = @history.stats
-      format("socket:   %s\nkernel:   %s (pid %d, %s)\nuptime:   %.1fs\nrequests: %d\nin:       %d bytes\nout:      %d bytes",
-             @socket_path, @backend.command.join(' '), @backend.pid,
-             @backend.alive? ? 'running' : 'dead', s[:uptime], s[:requests],
-             s[:in_bytes], s[:out_bytes])
-    end
-
-    def format_tail(count)
-      entries = @history.tail(count)
-      return '(no messages yet)' if entries.empty?
-
-      entries.map do |e|
-        "[#{e.time.strftime('%H:%M:%S')}] < #{one_line(e.input)}\n" \
-          "           > #{one_line(e.output)}"
-      end.join("\n")
-    end
-
-    def one_line(text)
-      flat = text.to_s.strip.gsub(/\s*\n\s*/, ' ⏎ ')
-      flat.length > 100 ? "#{flat[0, 97]}..." : flat
+  def show_request id = nil
+    request do
+      Log.info "Request show #{id.nil? ? 'last' : id } output"
+      @socket.puts "%show:#{id}"
     end
   end
 
-  # Command line front end.
-  class CLI
-    USAGE = <<~TEXT.freeze
-      Usage:
-        repl kernel [options] COMMAND [ARGS...]   start a REPL server
-        repl send [options] [TEXT...]             send a command (stdin if no TEXT)
-        repl post [options] [TEXT...]             send a command, expect no answer
-        repl editor-send [options] [TEXT...]      send an editor region and craft
-                                                  its output back
-        repl signal [options] [NAME]              signal the kernel (default INT)
-        repl list                                 list running servers
-        repl version | help
+  # Sends the buffer block by block - the '#=>' markers are where it is cut -
+  # and writes it back with every output block filled in with the answer of the
+  # code that precedes it.
+  def notebook_request
+    script = Notebook.parse @input.read
 
-      kernel options:
-        --socket PATH      socket to listen on (default: /tmp/repl-kernel-XXXXXXX)
-        --marker TEMPLATE  printf template making the kernel echo a token,
-                           e.g. --marker 'puts "%s"' (most reliable)
-        --prompt REGEX     regex matching the kernel prompt
-        --idle SECONDS     silence marking the end of an answer (default 0.3)
-        --wait SECONDS     wait for the first byte of an answer (default 2.0)
-        --timeout SECONDS  inactivity limit in marker/prompt mode (default 30)
-        --history N        number of messages kept for `tail` (default 100)
-
-      send/post/editor-send/signal options:
-        --socket PATH      server socket; defaults to $REPL_SOCKET or to the
-                           only running server
-
-      signal names: INT, TSTP, CONT, TERM, ... or control characters such as
-      ^C, ^Z, ^D (EOF closes the kernel's input).
-    TEXT
-
-    def initialize(argv, out: $stdout, err: $stderr, stdin: $stdin,
-                   registry: Registry.new)
-      @argv = argv.dup
-      @out = out
-      @err = err
-      @stdin = stdin
-      @registry = registry
+    script.commands.each do |command|
+      next if command.blank?
+      Log.info "notebook: command '#{command.code}'"
+      status, data, id = exchange do
+        @socket.puts "%send:#{command.code.size}"
+        @socket.write command.code
+      end
+      if status != 'Ok'
+        Log.error "ERR: #{data}"
+        return -1
+      end
+      command.output = data
+      command.id = id
     end
 
-    def run
-      command = @argv.shift
-      case command
-      when 'kernel' then cmd_kernel(@argv)
-      when 'send' then cmd_send(@argv)
-      when 'post' then cmd_post(@argv)
-      when 'editor-send' then cmd_editor_send(@argv)
-      when 'signal' then cmd_signal(@argv)
-      when 'list' then cmd_list
-      when 'version', '--version', '-v' then @out.puts("repl #{VERSION}") || 0
-      when nil, 'help', '--help', '-h' then @out.puts(USAGE) || 0
-      else
-        @err.puts("unknown command '#{command}'\n\n#{USAGE}")
-        1
+    @output.print script.render
+    0
+  rescue => e
+    Log.error "[Connection closed by server: #{e.message}]"
+    -1
+  end
+
+  def self.new_from_args argv, method
+    options = {
+      socket: Server::Socket::default
+    }
+
+    parser = OptionParser.new do |o|
+      Log.logging_options options, o
+      o.on('--socket PATH') do |v|
+        Log.raise "ERR: Server is not running at #{v}" \
+          unless (options[:socket] = Server::Socket.new(v)).alive
       end
-    rescue Error => e
-      @err.puts("repl: #{e.message}")
-      1
+      o.on('-e', '--echo') { options[:echo] = true }
     end
+    args = parser.order(argv)
+    Log.info "Client.options: #{options}, args:#{args}"
+    Client.new(**options).send(method, *args)
+  end
 
-    # Resolution order: --socket, $REPL_SOCKET, the only running server.
-    def resolve_socket(explicit = nil)
-      return explicit if explicit && !explicit.empty?
+  private
+  # One request per connection: the server accepts, serves and closes, so a
+  # command made of several requests (notebook) reconnects for each of them.
+  def exchange &block
+    @socket = UNIXSocket.new(@socket_path)
+    block.call
+    read_response
+  ensure
+	@socket.close unless @socket.nil? || @socket.closed?
+	Log.info "Client disconnected"
+  end
 
-      from_env = ENV['REPL_SOCKET']
-      return from_env if from_env && !from_env.empty?
-
-      servers = @registry.servers
-      raise Error, 'no running server found; start one with `repl kernel CMD`' if servers.empty?
-
-      if servers.size > 1
-        list = servers.map { |s| "  #{s['socket']}  (#{s['command']})" }.join("\n")
-        raise Error, "several servers are running, use --socket:\n#{list}"
-      end
-      servers.first['socket']
-    end
-
-    private
-
-    def cmd_kernel(argv)
-      options = { history: DEFAULT_HISTORY, idle: DEFAULT_IDLE_TIMEOUT,
-                  wait: DEFAULT_WAIT_TIMEOUT, timeout: DEFAULT_TIMEOUT }
-      parser = OptionParser.new do |o|
-        o.on('--socket PATH') { |v| options[:socket] = v }
-        o.on('--marker TEMPLATE') { |v| options[:marker] = v }
-        o.on('--prompt REGEX') { |v| options[:prompt] = v }
-        o.on('--idle SECONDS', Float) { |v| options[:idle] = v }
-        o.on('--wait SECONDS', Float) { |v| options[:wait] = v }
-        o.on('--timeout SECONDS', Float) { |v| options[:timeout] = v }
-        o.on('--history N', Integer) { |v| options[:history] = v }
-        o.on('-h', '--help') { options[:help] = true }
-      end
-      command = parser.order(argv)
-      return (@out.puts(USAGE) || 0) if options[:help]
-      raise Error, "kernel command is required\n\n#{USAGE}" if command.empty?
-
-      backend = Backend.new(command, idle_timeout: options[:idle],
-                                     wait_timeout: options[:wait],
-                                     timeout: options[:timeout],
-                                     prompt: options[:prompt],
-                                     marker: options[:marker])
-      server = Server.new(backend, socket_path: options[:socket],
-                                   registry: @registry,
-                                   history: History.new(options[:history]),
-                                   out: @out)
-      server.start
-      @out.puts("Starting kernel '#{command.join(' ')}' on socket '#{server.socket_path}'")
-      trap('INT') do
-        next if server.forward_interrupt
-
-        server.stop
-        exit 0
-      end
-      trap('TERM') { server.stop; exit 0 }
-      server.run_admin(@stdin)
+  def request &block
+    status, data, _id = exchange(&block)
+    case status
+    when 'Ok'
+      @output.puts data unless data.nil?
       0
+    else
+      Log.error "ERR: #{data}"
+      -1
     end
+  rescue => e
+    Log.error "[Connection closed by server: #{e.message}]"
+    -1
+  end
 
-    def cmd_send(argv)
-      input, options = read_input(argv)
-      return 0 unless input
+  # The answer carries the id of the request that produced it: the server keeps
+  # it under that id, so it can be asked for again with `show ID`.
+  def read_response
+    resp = @socket.gets
+    Log.raise "Failed get response" if resp.nil?
 
-      output = Client.call(resolve_socket(options[:socket]), input)
-      @out.puts(output) unless output.empty?
-      0
-    end
+    #Log.info "resp: #{resp.size}: '#{resp}'"
 
-    def cmd_post(argv)
-      input, options = read_input(argv)
-      return 0 unless input
+    m = /^%<(Ok|Fail):([0-9]+)>([0-9]+)$/.match resp
+    Log.raise "Unexpected server reply format" if m.nil?
 
-      Client.post(resolve_socket(options[:socket]), input)
-      0
-    end
+    data = @socket.read($3.to_i) if $3.to_i > 0
+    [$1, data, $2.to_i]
+  end
 
-    def cmd_editor_send(argv)
-      input, options = read_input(argv)
-      return 0 unless input
-
-      socket = resolve_socket(options[:socket])
-      @out.puts(Editor.run(input) { |command| Client.call(socket, command) })
-      0
-    end
-
-    # Shared front end of send/post/editor-send: options, then TEXT or stdin.
-    def read_input(argv)
-      options = {}
-      parser = OptionParser.new do |o|
-        o.on('--socket PATH') { |v| options[:socket] = v }
-        o.on('-h', '--help') { options[:help] = true }
-      end
-      rest = parser.order(argv)
-      if options[:help]
-        @out.puts(USAGE)
-        return [nil, nil]
-      end
-
-      input = rest.empty? ? @stdin.read : rest.join(' ')
-      raise Error, 'nothing to send' if input.to_s.strip.empty?
-
-      [input, options]
-    end
-
-    def cmd_signal(argv)
-      options = {}
-      parser = OptionParser.new do |o|
-        o.on('--socket PATH') { |v| options[:socket] = v }
-        o.on('-h', '--help') { options[:help] = true }
-      end
-      rest = parser.order(argv)
-      return (@out.puts(USAGE) || 0) if options[:help]
-
-      name = rest.first || 'INT'
-      @out.puts(Client.signal(resolve_socket(options[:socket]), name))
-      0
-    end
-
-    def cmd_list
-      servers = @registry.servers
-      if servers.empty?
-        @out.puts('no running servers')
-      else
-        servers.each { |s| @out.puts("#{s['socket']}\t#{s['command']}\tpid #{s['pid']}") }
-      end
-      0
+  def setup_signal_handlers
+    trap('INT') do
+      Process.kill('INT', @server_pid)
     end
   end
 end
 
-exit(Repl::CLI.new(ARGV).run) if $PROGRAM_NAME == __FILE__
+class CommandLineInterface
+  USAGE = <<~TEXT.freeze
+  Usage:
+    repl kernel [options] COMMAND [ARGS...]   start a REPL server
+    repl send [options]                       send a command (stdin if no TEXT)
+    repl notebook [options]                   send a buffer, echo it back with
+                                              every '#=>' block filled in
+    repl post [options]                       send a command, expect no answer
+    repl stop [options]                       stop the kernel
+    repl int, interrupt [options]             interrupt the running command
+    repl list, ls                             list running kernels
+    repl show [id]                            show output for id (last if id not defined)
+    repl set [options]                        set kernel/session options
+
+  kernel options:
+    --prompt REGEX        regex matching the kernel's prompt
+    --output PATH         kernel echoes its raw output while a
+                           client is connected ('stdout'/'-', the default,
+                           or any file path)
+    -c, --cursor          keep the cursor visible
+    -d, --daemon          detach and run in the background; implies
+                           -c and defaults --output/--logfile to discard
+                           (/dev/null) unless set explicitly
+    -v / -s               raise / lower log verbosity
+    --logfile PATH         redirect log output ('stdout'/'-' or any file
+                           path); available on every command, also settable
+                           via REPL_LOGFILE (REPL_LOGLEVEL sets the level)
+
+  set options (KEY=VALUE):
+    loglevel=LEVEL         change logging verbosity (DEBUG/INFO/WARN/FATAL)
+    output=PATH             redirect the kernel's output ('stdout'/'-' to
+                           restore standard output, or any file path)
+    logfile=PATH            redirect the log output ('stdout'/'-' to
+                           restore standard output, or any file path)
+  TEXT
+
+  def initialize(
+      out: $stdout,
+      err: $stderr)
+
+    @out = out
+    @err = err
+  end
+
+  def invoke argv
+    case (command = argv.shift)
+    when 'list', 'ls'
+      cmd_list
+    when 'show'
+      cmd_show argv
+    when 'kernel'
+      cmd_kernel argv
+    when 'int', 'interrupt'
+      cmd_interrupt argv
+    when 'send'
+      cmd_send argv
+    when 'notebook'
+      cmd_notebook argv
+    when 'stop'
+      cmd_stop argv
+    when 'post'
+      cmd_post argv
+    when 'set'
+      cmd_set argv
+    when nil, 'help', '--help', '-h'
+      @out.puts(USAGE)
+      0
+    else
+      @err.puts("unknown command '#{command}'\n\n#{USAGE}")
+      -1
+    end
+  rescue => e
+    @err.puts("repl: #{e.message}")
+    -1
+  end
+
+  private
+
+  def cmd_kernel argv
+    options = {}
+    #  prompt: /^.+\$ $/,
+    #}
+    parser = OptionParser.new do |o|
+      Log.logging_options options, o
+      o.on('--prompt REGEX') { |v| options[:prompt] = Regexp.new(v) }
+      o.on('--output PATH') { |v| options[:output] = v }
+      o.on('-h', '--help') { options[:help] = true }
+      o.on('-c', '--cursor') { options[:hide_cursor] = false }
+      o.on('-d', '--daemon') { options[:daemon] = true }
+    end
+    cmd = parser.order(argv)
+    cmd = ['bash'] if cmd.nil? || cmd.empty?
+    return (@out.puts(USAGE) || 0) if options[:help]
+
+    if options[:daemon]
+      # No terminal to speak of once detached: don't touch the cursor, and
+      # discard whatever wasn't explicitly pointed elsewhere.
+      options[:hide_cursor] = false
+      options[:output] ||= File::NULL
+      Log.redirect(File::NULL) unless options[:logfile]
+      Process.daemon(true)
+    end
+
+    server_options = options.slice(:hide_cursor)
+    kernel_options = options.slice(:prompt, :output)
+
+    kernel = Kernel.new(cmd, **kernel_options)
+    kernel.start ? server = Server.new(kernel, **server_options).run : -1
+  end
+
+  def cmd_list
+    puts Server::Socket::list
+    0
+  end
+
+  def cmd_interrupt argv
+    options = {
+      socket: Server::Socket::default,
+    }
+    OptionParser.new do |o|
+      Log.logging_options options, o
+      o.on('--socket PATH') {|v| options[:socket] = Server::Socket.new(v)}
+    end.order(argv)
+    Log.info "Interrupting #{options[:socket]}..."
+    if options[:socket].alive
+      Process.kill('INT', options[:socket].pid)
+      Log.info "Signal sent to #{options[:socket].pid}"
+    else
+      Log.info "Kernel is not alive"
+    end
+  end
+
+  def cmd_send argv
+    Client.new_from_args(argv, :send_request)
+  end
+
+  def cmd_notebook argv
+    Client.new_from_args(argv, :notebook_request)
+  end
+
+  def cmd_post argv
+    Client.new_from_args(argv, :post_request)
+  end
+
+  def cmd_stop argv
+    Client.new_from_args(argv, :stop_request)
+  end
+
+  def cmd_show argv
+    Client.new_from_args(argv, :show_request)
+  end
+
+  def cmd_set argv
+    Client.new_from_args(argv, :set_request)
+  end
+end
+
+end # module REPL
+
+exit(REPL::CommandLineInterface.new.invoke ARGV) \
+  if $PROGRAM_NAME == __FILE__
+

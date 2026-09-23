@@ -1,7 +1,7 @@
 " autoload/repl.vim -- talk to a `repl` kernel from the buffer.
 "
 " Two ways of sending a region:
-"   * filter -- the region is replaced by `repl editor-send`, which echoes the
+"   * filter -- the region is replaced by `repl notebook`, which echoes the
 "     code back with every '#=>' output block filled in with a fresh answer;
 "   * post   -- the region is written to `repl post`, nothing comes back and
 "     the buffer is left alone.
@@ -17,7 +17,7 @@ function! repl#executable() abort
   if !empty(get(g:, 'repl_command', ''))
     return g:repl_command
   endif
-  if executable('./repl')
+  if executable('/Volumes/Machintosh/Users/igk/src/repl_v2/repl')
     return './repl'
   endif
   let l:bundled = s:bundled
@@ -71,7 +71,7 @@ function! repl#paragraph() abort
   return [l:first, l:last]
 endfunction
 
-" The markdown code block under the cursor, fences included. `editor-send`
+" The markdown code block under the cursor, fences included. `notebook`
 " keeps the fences in its answer but hides them from the kernel.
 function! repl#section() abort
   let l:cursor = line('.')
@@ -98,9 +98,9 @@ endfunction
 
 " --- actions ----------------------------------------------------------------
 
-" Replace lines [first, last] with the answer of `repl editor-send`.
+" Replace lines [first, last] with the answer of `repl notebook`.
 function! repl#send(first, last) abort
-  let l:out = s:run(s:command('editor-send'), getline(a:first, a:last))
+  let l:out = s:run(s:command('notebook'), getline(a:first, a:last))
   if l:out is v:null
     return
   endif
@@ -122,9 +122,13 @@ function! repl#send(first, last) abort
   call winrestview(l:view)
 endfunction
 
-" Write lines [first, last] to `repl post`; the buffer is not touched.
+" Write lines [first, last] to `repl post`; the buffer is not touched. Fences
+" are dropped first: `post` sends its input to the kernel as it is, and a
+" '```bash' line is three backticks to a shell - an unbalanced pair that opens
+" a command substitution, swallows the block and leaves a nested shell holding
+" the kernel, after which nothing answers any more.
 function! repl#post(first, last) abort
-  let l:lines = getline(a:first, a:last)
+  let l:lines = filter(getline(a:first, a:last), 'v:val !~# s:fence')
   if empty(filter(copy(l:lines), 'v:val !~# ''^\s*$'''))
     call s:error('nothing to post')
     return
@@ -138,10 +142,11 @@ endfunction
 " --- clearing ---------------------------------------------------------------
 
 let s:open = '^\s*#=>\s*$'
-let s:close = '#=='
+" The terminator carries the id of the answer it closes: '#==' or '#==[45]'.
+let s:close = '^#==\%(\[[0-9]\+\]\)\?$'
 
 " First line after the output block opened on the line before `start`, i.e. the
-" block is [start, result - 1]. The rules are the ones `repl editor-send` uses
+" block is [start, result - 1]. The rules are the ones `repl notebook` uses
 " when it drops a stale block: comment lines up to a '#==' terminator, or up to
 " the first line that is not a comment; blank lines belong to the block only
 " when a '#==' still follows.
@@ -149,7 +154,7 @@ function! s:block_end(start, limit) abort
   let l:lnum = a:start
   while l:lnum <= a:limit
     let l:line = trim(getline(l:lnum))
-    if l:line ==# s:close
+    if l:line =~# s:close
       return l:lnum + 1
     endif
     if empty(l:line)
@@ -157,7 +162,7 @@ function! s:block_end(start, limit) abort
       while l:next <= a:limit && empty(trim(getline(l:next)))
         let l:next += 1
       endwhile
-      if l:next <= a:limit && trim(getline(l:next)) ==# s:close
+      if l:next <= a:limit && trim(getline(l:next)) =~# s:close
         return l:next + 1
       endif
       return l:lnum
