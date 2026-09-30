@@ -288,6 +288,8 @@ class Server
     client.send_response 'Ok'
   end
 
+  KEYS = %w[name cmd caching output loglevel logfile].freeze
+
   def values
     {
       'name' => @kernel.name,
@@ -414,7 +416,8 @@ class Server::Socket
     (l = self.list).size == 1 ? l.first : nil
   end
 
-  MIN_PREFIX = 4
+  MIN_PREFIX = 2    # shortest prefix accepted as a socket
+  SHOWN_PREFIX = 8  # shortest prefix shown by `ls`
 
   def digest
     @digest ||= Digest::MD5.hexdigest(@path)
@@ -423,7 +426,7 @@ class Server::Socket
   # Shortest digest prefix that tells this socket apart from the others.
   def prefix sockets
     others = sockets.reject { |s| s.path == @path }
-    n = (MIN_PREFIX..digest.size).find do |i|
+    n = (SHOWN_PREFIX..digest.size).find do |i|
       others.none? { |s| s.digest.start_with?(digest[0, i]) }
     end
     digest[0, n || digest.size]
@@ -1181,14 +1184,13 @@ class CommandLineInterface
     repl post [options]                       send a command, expect no answer
     repl stop [options]                       stop the kernel
     repl int, interrupt [options]             interrupt the running command
-    repl list, ls [-n]                        list running kernels (hash, socket, name, cmd);
-                                              -n: hash and socket only, don't query kernels
+    repl list, ls [options]                   list running kernels
     repl show [id]                            show output for id (last if id not defined)
     repl set [options] KEY=VALUE              set kernel/session options
     repl get [options] [KEY...]               print 'key=value' lines (all if no KEY)
 
   common options:
-    --socket PATH|HASH    kernel socket, or an unambiguous prefix (4+ chars)
+    --socket PATH|HASH    kernel socket, or an unambiguous prefix (2+ chars)
                            of its hash as shown by `ls`; defaults to
                            REPL_SOCKET, then to the only running kernel
 
@@ -1208,6 +1210,13 @@ class CommandLineInterface
     --logfile PATH         redirect log output ('stdout'/'-' or any file
                            path); available on every command, also settable
                            via REPL_LOGFILE (REPL_LOGLEVEL sets the level)
+
+  ls options:
+    -o FIELD,...          columns to print (default: hash,socket,name,cmd):
+                           hash, socket, pid, or any `get` key
+    -n                    don't query kernels (default: hash,socket);
+                           kernel fields show as '?'
+    --no-header           omit the header line
 
   set options (KEY=VALUE, an empty VALUE resets KEY to its default):
     loglevel=LEVEL         change logging verbosity (DEBUG/INFO/WARN/FATAL)
@@ -1239,7 +1248,7 @@ class CommandLineInterface
     case (command = argv.shift)
     when 'version'
       cmd_version
-    when 'list', 'ls'
+    when 'list', 'ls', 'ps', nil
       cmd_list argv
     when 'show'
       cmd_show argv
@@ -1259,7 +1268,7 @@ class CommandLineInterface
       cmd_set argv
     when 'get'
       cmd_get argv
-    when nil, 'help', '--help', '-h'
+    when 'help', '--help', '-h'
       @out.puts(USAGE)
       0
     else
@@ -1307,23 +1316,50 @@ class CommandLineInterface
     kernel.start ? server = Server.new(kernel, **server_options).run : -1
   end
 
-  # A kernel busy with a command can't answer, its name and cmd show as '?'.
+  LOCAL_FIELDS = %w[hash socket pid].freeze
+  LIST_FIELDS = LOCAL_FIELDS + Server::KEYS
+
   def cmd_list argv
-    sockets_only = false
-    OptionParser.new { |o| o.on('-n') { sockets_only = true } }.parse(argv)
+    fields = nil
+    header = true
+    local_only = false
+    OptionParser.new do |o|
+      o.on('-n') { local_only = true }
+      o.on('-o FIELDS', Array) { |v| fields = v }
+      o.on('--[no-]header') { |v| header = v }
+    end.parse(argv)
+    fields ||= local_only ? %w[hash socket] : %w[hash socket name cmd]
+    unknown = fields - LIST_FIELDS
+    raise "Unknown field(s) '#{unknown.join(', ')}'" unless unknown.empty?
+
     sockets = Server::Socket.list
-    rows = sockets.map do |socket|
-      row = [socket.prefix(sockets), socket.to_s]
-      next row if sockets_only
-      info = Client.new(socket: socket, timeout: 0.5, interruptible: false).
-        values('name', 'cmd') || {}
-      row + [info.fetch('name', '?'), info.fetch('cmd', '?')]
+    rows = sockets.map { |socket| list_row socket, sockets, fields, local_only }
+    rows.unshift fields.map(&:upcase) if header
+    print_table rows
+    0
+  end
+
+  # A kernel busy with a command can't answer, its fields show as '?'.
+  def list_row socket, sockets, fields, local_only
+    remote = fields - LOCAL_FIELDS
+    info = {}
+    unless local_only || remote.empty?
+      client = Client.new(socket: socket, timeout: 0.5, interruptible: false)
+      info = client.values(*remote) || {}
     end
+    local = {
+      'hash' => socket.prefix(sockets),
+      'socket' => socket.to_s,
+      'pid' => socket.pid.to_s,
+    }
+    fields.map { |f| local[f] || info.fetch(f, '?') }
+  end
+
+  def print_table rows
     widths = rows.transpose.map { |column| column.map(&:size).max }
     rows.each do |row|
       @out.puts row.zip(widths).map { |v, w| v.ljust(w) }.join('  ').rstrip
     end
-    0
   end
 
   def cmd_version

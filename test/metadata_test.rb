@@ -131,9 +131,47 @@ describe 'kernel metadata and caching' do
       Digest::MD5.hexdigest(@socket)
     end
 
-    # The prefix ls shows: at least 4 characters of the socket digest.
+    # The prefix ls shows: at least 8 characters of the socket digest.
     def hash_prefix
-      "#{digest[0, 4]}[0-9a-f]*"
+      "#{digest[0, 8]}[0-9a-f]*"
+    end
+
+    it 'ls: prints a header, aligned with the columns' do
+      repl('set', 'name=shell')
+      out, _err, _status = Open3.capture3(METADATA_BIN, 'ls')
+      header = out.lines.first
+      _(header).must_match(/^HASH\s+SOCKET\s+NAME\s+CMD$/)
+      line = out.lines.find { |l| l.include?(@socket) }
+      %w[SOCKET NAME CMD].zip([@socket, 'shell', 'bash']).each do |title, value|
+        _(line.index(value)).must_equal header.index(title)
+      end
+    end
+
+    it 'ls --no-header: omits the header' do
+      out, _err, _status = Open3.capture3(METADATA_BIN, 'ls', '--no-header')
+      _(out).wont_match(/HASH/)
+      _(out).must_include @socket
+    end
+
+    it 'ls -o: prints the given fields in the given order' do
+      repl('set', 'name=shell')
+      out, _err, status = Open3.capture3(METADATA_BIN, 'ls', '-o', 'name,pid,caching')
+      _(status.success?).must_equal true
+      _(out.lines.first).must_match(/^NAME\s+PID\s+CACHING$/)
+      _(out).must_match(/^shell\s+#{@server_pid}\s+on$/)
+    end
+
+    it 'ls -o: accepts every get key' do
+      fields = %w[hash socket pid] + REPL::Server::KEYS
+      out, _err, status = Open3.capture3(METADATA_BIN, 'ls', '-o', fields.join(','))
+      _(status.success?).must_equal true
+      _(out.lines.find { |l| l.include?(@socket) }).wont_include '?'
+    end
+
+    it 'ls -o: fails on an unknown field' do
+      _out, err, status = Open3.capture3(METADATA_BIN, 'ls', '-o', 'name,bogus')
+      _(status.success?).must_equal false
+      _(err).must_match(/bogus/)
     end
 
     it 'ls: shows the hash prefix in the first column' do
@@ -150,9 +188,9 @@ describe 'kernel metadata and caching' do
       _(out).must_equal "by-hash\n"
     end
 
-    it '--socket: rejects a hash prefix shorter than 4 characters' do
+    it '--socket: rejects a hash prefix shorter than 2 characters' do
       _out, err, status = Open3.capture3(
-        METADATA_BIN, 'send', '--socket', digest[0, 3], stdin_data: "echo x\n"
+        METADATA_BIN, 'send', '--socket', digest[0, 1], stdin_data: "echo x\n"
       )
       _(status.success?).must_equal false
       _(err).must_match(/too short/)
@@ -220,32 +258,34 @@ end
 describe 'REPL::Server::Socket digest' do
   KernelSocket = REPL::Server::Socket
 
-  # Two sockets whose digests share the first 4 characters.
-  def colliding
+  # Two sockets whose digests share the first n characters.
+  def colliding n
     seen = {}
     (1..).each do |pid|
       socket = KernelSocket.new("/tmp/REPL.#{pid}.sock")
-      other = seen[socket.digest[0, 4]]
+      other = seen[socket.digest[0, n]]
       return [other, socket] if other
-      seen[socket.digest[0, 4]] = socket
+      seen[socket.digest[0, n]] = socket
     end
   end
 
-  it 'uses 4 characters when they are unique' do
+  it 'shows 8 characters when they are unique' do
     a, b = KernelSocket.new('/tmp/REPL.1.sock'), KernelSocket.new('/tmp/REPL.2.sock')
-    _(a.prefix([a, b])).must_equal a.digest[0, 4]
+    _(a.prefix([a, b])).must_equal a.digest[0, 8]
   end
 
-  it 'extends the prefix until it is unambiguous' do
-    a, b = colliding
-    _(a.prefix([a, b]).size).must_be :>, 4
+  it 'extends the shown prefix until it is unambiguous' do
+    a, b = colliding 8
+    _(a.prefix([a, b]).size).must_be :>, 8
     _(b.digest).wont_be :start_with?, a.prefix([a, b])
   end
 
-  it 'resolves a unique prefix and rejects an ambiguous one' do
-    a, b = colliding
-    _(KernelSocket.resolve(a.prefix([a, b]), [a, b]).path).must_equal a.path
-    _ { KernelSocket.resolve(a.digest[0, 4], [a, b]) }.must_raise RuntimeError
+  it 'resolves a unique prefix of 2+ characters and rejects an ambiguous one' do
+    a, b = colliding 2
+    unique = (3..32).map { |n| a.digest[0, n] }.find { |p| !b.digest.start_with?(p) }
+    _(KernelSocket.resolve(unique, [a, b]).path).must_equal a.path
+    _(KernelSocket.resolve(b.digest[0, 2], [b]).path).must_equal b.path
+    _ { KernelSocket.resolve(a.digest[0, 2], [a, b]) }.must_raise RuntimeError
     _ { KernelSocket.resolve('ffffffffffff', [a, b]) }.must_raise RuntimeError
   end
 

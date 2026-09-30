@@ -123,11 +123,14 @@ cmd=bash
 $ repl set caching=on
 $ repl set name=main
 $ repl ls
-3f2a  /tmp/REPL.4242.sock  main  bash
+HASH      SOCKET               NAME  CMD
+3f2a91c0  /tmp/REPL.4242.sock  main  bash
+$ repl ls --no-header -o name,pid,caching
+main  4242  on
 ```
 
 ```sh
-# a socket can be given by an unambiguous hash prefix (4+ chars), or via env
+# a socket can be given by an unambiguous hash prefix (2+ chars), or via env
 $ echo 'echo hi' | repl send --socket 3f2a
 hi
 $ export REPL_SOCKET=3f2a
