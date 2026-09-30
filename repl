@@ -1170,64 +1170,141 @@ class CommandLineInterface
   USAGE = <<~TEXT.freeze
   Usage: repl [general options] COMMAND [command options]
 
-    repl kernel [options] COMMAND [ARGS...]   start a REPL server
-    repl send [options]                       send a command (stdin if no TEXT)
-    repl notebook [options]                   send a buffer, echo it back with
-                                              every '#=>' block filled in
-    repl post [options]                       send a command, expect no answer
-    repl stop [options]                       stop the kernel
-    repl int, interrupt [options]             interrupt the running command
-    repl list, ls [options]                   list running kernels
-    repl show [id]                            show output for id (last if id not defined)
-    repl set [options] KEY=VALUE              set kernel/session options
-    repl get [options] [KEY...]               print 'key=value' lines (all if no KEY)
+  Commands:
+    kernel     start a REPL server around a command (default: bash)
+    send       send stdin to the kernel, print the answer
+    post       send stdin to the kernel, don't wait for the answer
+    notebook   send a buffer, echo it back with every '#=>' block filled in
+    show       print a cached answer (the last one by default)
+    get        print kernel settings as 'key=value' lines
+    set        change a kernel setting
+    interrupt  interrupt the running command (alias: int)
+    stop       stop the kernel
+    ls         list running kernels (aliases: list, ps; default command)
+    version    print the version
+    help       print this help, or `help COMMAND` for a command's options
 
-  general options (before COMMAND):
-    --socket PATH|HASH    kernel socket, or an unambiguous prefix (2+ chars)
-                           of its hash as shown by `ls`; defaults to
-                           REPL_SOCKET, then to the only running kernel
+  General options:
+    --socket PATH|HASH    kernel to talk to: a socket path, or an unambiguous
+                          prefix (2+ chars) of its hash as shown by `ls`
     -v / -s               raise / lower log verbosity
-    --logfile PATH        redirect log output ('stdout'/'-' or any file
-                           path), also settable via REPL_LOGFILE
-                           (REPL_LOGLEVEL sets the level)
+    --logfile PATH        write the log to PATH ('stdout'/'-' or a file)
+    -h, --help            print this help
 
-  kernel options:
-    --prompt REGEX        regex matching the kernel's prompt
-    --name NAME           kernel name shown by `ls` (default: empty)
-    --[no-]caching        keep every answer for `show ID`, otherwise
-                           only the last one (default: on)
-    --output PATH         kernel echoes its raw output while a
-                           client is connected ('stdout'/'-', the default,
-                           or any file path)
-    -c, --cursor          keep the cursor visible
-    -d, --daemon          detach and run in the background; implies
-                           -c and defaults --output/--logfile to discard
-                           (/dev/null) unless set explicitly
+  Environment:
+    REPL_SOCKET           default for --socket; without it, the only
+                          running kernel is used
+    REPL_LOGLEVEL         initial log level (DEBUG/INFO/WARN/FATAL)
+    REPL_LOGFILE          initial log file
 
-  ls options:
-    -o FIELD,...          columns to print (default: hash,socket,name,cmd):
-                           hash, socket, pid, or any `get` key
-    -n                    don't query kernels (default: hash,socket);
-                           kernel fields show as '?'
-    --no-header           omit the header line
-
-  set options (KEY=VALUE, an empty VALUE resets KEY to its default):
-    loglevel=LEVEL         change logging verbosity (DEBUG/INFO/WARN/FATAL)
-    output=PATH             redirect the kernel's output ('stdout'/'-' to
-                           restore standard output, or any file path)
-    logfile=PATH            redirect the log output ('stdout'/'-' to
-                           restore standard output, or any file path)
-    caching=on|off          keep every answer, or only the last one
-    name=NAME               rename the kernel
-
-  get keys:
-    name                   kernel name
-    cmd                    command the kernel was started with
-    caching                output caching state (on/off)
-    output                 where the kernel's raw output goes
-    loglevel               logging verbosity
-    logfile                where log output goes
+  Run `repl help COMMAND` or `repl COMMAND -h` for command options.
   TEXT
+
+  KEYS_HELP = <<~TEXT.chomp.gsub(/^/, '  ')
+    name                  kernel name (default: empty)
+    cmd                   command the kernel was started with (read-only)
+    caching               on: keep every answer for `show ID`,
+                          off: only the last one
+    output                where the kernel's raw output goes
+                          ('stdout'/'-' or a file path)
+    loglevel              log verbosity (DEBUG/INFO/WARN/FATAL)
+    logfile               where the log goes ('stdout'/'-' or a file path)
+  TEXT
+
+  HELP = {
+    'kernel' => <<~TEXT,
+      Usage: repl [general options] kernel [options] [COMMAND [ARGS...]]
+
+      Starts COMMAND (default: bash) behind a socket in /tmp.
+
+      Options (before COMMAND):
+        --prompt REGEX        regex matching the kernel's prompt
+                              (detected from the banner by default)
+        --name NAME           kernel name shown by `ls` (default: empty)
+        --[no-]caching        keep every answer for `show ID`, otherwise
+                              only the last one (default: on)
+        --output PATH         where the kernel echoes its raw output
+                              ('stdout'/'-', the default, or a file path)
+        -c, --cursor          keep the cursor visible
+        -d, --daemon          run in the background; implies -c and discards
+                              output and log unless --output/--logfile is set
+        -h, --help            print this help
+    TEXT
+    'send' => <<~TEXT,
+      Usage: repl [general options] send < INPUT
+
+      Sends INPUT to the kernel line by line and prints the answer.
+    TEXT
+    'post' => <<~TEXT,
+      Usage: repl [general options] post < INPUT
+
+      Sends INPUT to the kernel and returns without waiting for the answer;
+      `show` prints it once the kernel is done.
+    TEXT
+    'notebook' => <<~TEXT,
+      Usage: repl [general options] notebook < BUFFER
+
+      Sends BUFFER block by block, cut at '#=>' markers, and prints it back
+      with every output block filled in. Markdown fences are echoed, but not
+      sent. The '#==[ID]' terminator carries the id for `show ID`.
+    TEXT
+    'show' => <<~TEXT,
+      Usage: repl [general options] show [ID]
+
+      Prints the answer with ID, or the last one. With caching off only the
+      last answer is kept.
+    TEXT
+    'get' => <<~TEXT,
+      Usage: repl [general options] get [KEY...]
+
+      Prints 'key=value' lines for the given keys, all of them by default.
+
+      Keys:
+      #{KEYS_HELP}
+    TEXT
+    'set' => <<~TEXT,
+      Usage: repl [general options] set KEY=VALUE
+
+      Changes a kernel setting; an empty VALUE resets KEY to its default.
+
+      Keys:
+      #{KEYS_HELP.lines.reject { |l| l.include?('(read-only)') }.join.chomp}
+    TEXT
+    'interrupt' => <<~TEXT,
+      Usage: repl [general options] interrupt
+
+      Interrupts the command the kernel is running (alias: int).
+    TEXT
+    'stop' => <<~TEXT,
+      Usage: repl [general options] stop
+
+      Stops the kernel.
+    TEXT
+    'ls' => <<~TEXT,
+      Usage: repl ls [options]
+
+      Lists running kernels (aliases: list, ps). A kernel busy with a command
+      can't answer: its fields show as '?'.
+
+      Options:
+        -o FIELD,...          columns to print (default: hash,socket,name,cmd):
+                              hash, socket, pid, or any `get` key
+        -n                    don't query kernels (default: hash,socket)
+        --no-header           omit the header line
+    TEXT
+    'version' => <<~TEXT,
+      Usage: repl version
+
+      Prints the version.
+    TEXT
+    'help' => <<~TEXT,
+      Usage: repl help [COMMAND]
+
+      Prints the general help, or the options of COMMAND.
+    TEXT
+  }.freeze
+
+  ALIASES = { 'list' => 'ls', 'ps' => 'ls', 'int' => 'interrupt' }.freeze
 
   def initialize(
       out: $stdout,
@@ -1239,16 +1316,20 @@ class CommandLineInterface
 
   def invoke argv
     argv = general_options argv
-    case (command = argv.shift)
+    command = argv.shift || 'ls'
+    command = ALIASES.fetch(command, command)
+    return help(command) if command != 'kernel' && (argv & %w[-h --help]).any?
+
+    case command
     when 'version'
       cmd_version
-    when 'list', 'ls', 'ps', nil
+    when 'ls'
       cmd_list argv
     when 'show'
       cmd_show argv
     when 'kernel'
       cmd_kernel argv
-    when 'int', 'interrupt'
+    when 'interrupt'
       cmd_interrupt argv
     when 'send'
       cmd_send argv
@@ -1262,9 +1343,8 @@ class CommandLineInterface
       cmd_set argv
     when 'get'
       cmd_get argv
-    when 'help', '--help', '-h'
-      @out.puts(USAGE)
-      0
+    when 'help'
+      argv.empty? ? help(nil) : help(ALIASES.fetch(argv.first, argv.first))
     else
       @err.puts("unknown command '#{command}'\n\n#{USAGE}")
       -1
@@ -1275,6 +1355,13 @@ class CommandLineInterface
   end
 
   private
+
+  def help command
+    text = command.nil? ? USAGE : HELP[command]
+    raise "unknown command '#{command}'" unless text
+    @out.puts text
+    0
+  end
 
   # General options go before the command, command options after it.
   def general_options argv
@@ -1308,7 +1395,7 @@ class CommandLineInterface
     end
     cmd = parser.order(argv)
     cmd = ['bash'] if cmd.nil? || cmd.empty?
-    return (@out.puts(USAGE) || 0) if options[:help]
+    return help('kernel') if options[:help]
 
     if options[:daemon]
       # No terminal to speak of once detached: don't touch the cursor, and
