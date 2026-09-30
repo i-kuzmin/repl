@@ -1168,7 +1168,7 @@ end
 
 class CommandLineInterface
   USAGE = <<~TEXT.freeze
-  Usage: repl [general options] COMMAND [command options]
+  Usage: repl [general options] [SOCKET] COMMAND [command options]
 
   Commands:
     kernel     start a REPL server around a command (default: bash)
@@ -1186,7 +1186,8 @@ class CommandLineInterface
 
   General options:
     --socket PATH|HASH    kernel to talk to: a socket path, or an unambiguous
-                          prefix (2+ chars) of its hash as shown by `ls`
+                          prefix (2+ chars) of its hash as shown by `ls`;
+                          may also be given bare, as SOCKET before COMMAND
     -v / -s               raise / lower log verbosity
     --logfile PATH        write the log to PATH ('stdout'/'-' or a file)
     -h, --help            print this help
@@ -1366,14 +1367,33 @@ class CommandLineInterface
     0
   end
 
-  # General options go before the command, command options after it.
+  # General options go before the command, command options after it. The
+  # socket may also be given bare, as the word right before the command.
   def general_options argv
     @options = {}
-    OptionParser.new do |o|
+    sockets = []
+    parser = OptionParser.new do |o|
       Log.logging_options @options, o
-      o.on('--socket PATH|HASH') { |v| @options[:socket] = v }
+      o.on('--socket PATH|HASH') { |v| sockets << v }
       o.on('-h', '--help') { @options[:help] = true }
-    end.order(argv).then { |rest| @options[:help] ? ['help'] : rest }
+    end
+    rest = parser.order(argv)
+    if bare_socket?(rest)
+      raise "Socket given both with --socket and as '#{rest.first}'" unless sockets.empty?
+      sockets << rest.shift
+    end
+    @options[:socket] = sockets.last
+    @options[:help] ? ['help'] : rest
+  end
+
+  def self.command? word
+    HELP.key?(word) || ALIASES.key?(word)
+  end
+
+  # A word that isn't a command, right before one, is a socket; anything else
+  # is left to fail as an unknown command.
+  def bare_socket? argv
+    argv.size > 1 && !self.class.command?(argv[0]) && self.class.command?(argv[1])
   end
 
   # The kernel commands talk to: --socket, REPL_SOCKET, or the only running one.

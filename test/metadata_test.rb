@@ -188,6 +188,30 @@ describe 'kernel metadata and caching' do
       _(out).must_equal "by-hash\n"
     end
 
+    it 'bare socket: a hash or path right before the command' do
+      [digest[0, 12], @socket].each do |ref|
+        out, _err, status = Open3.capture3(
+          METADATA_BIN, '-s', ref, 'send', stdin_data: "echo bare\n"
+        )
+        _(status.success?).must_equal true
+        _(out).must_equal "bare\n"
+      end
+    end
+
+    it 'bare socket: rejected together with --socket' do
+      _out, err, status = Open3.capture3(
+        METADATA_BIN, '--socket', @socket, digest[0, 12], 'get', 'name'
+      )
+      _(status.success?).must_equal false
+      _(err).must_match(/both/)
+    end
+
+    it 'bare socket: a lone unknown word is still an unknown command' do
+      _out, err, status = Open3.capture3(METADATA_BIN, 'sned')
+      _(status.success?).must_equal false
+      _(err).must_match(/unknown command 'sned'/)
+    end
+
     it '--socket: rejects a hash prefix shorter than 2 characters' do
       _out, err, status = Open3.capture3(
         METADATA_BIN, '--socket', digest[0, 1], 'send', stdin_data: "echo x\n"

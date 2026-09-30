@@ -138,6 +138,8 @@ main  4242  on
 # a socket can be given by an unambiguous hash prefix (2+ chars), or via env
 $ echo 'echo hi' | repl --socket 3f2a send
 hi
+$ echo 'echo hi' | repl 3f2a send   # same, without --socket
+hi
 $ export REPL_SOCKET=3f2a
 ```
 
