@@ -114,6 +114,25 @@ $ repl show 4
 2
 ```
 
+```sh
+# kernel metadata and output caching
+$ repl kernel --name shell --no-caching bash
+$ repl get name cmd
+name=shell
+cmd=bash
+$ repl set caching=on
+$ repl set name=main
+$ repl ls
+3f2a  /tmp/REPL.4242.sock  main  bash
+```
+
+```sh
+# a socket can be given by an unambiguous hash prefix (4+ chars), or via env
+$ echo 'echo hi' | repl send --socket 3f2a
+hi
+$ export REPL_SOCKET=3f2a
+```
+
 # Vim plugin and specific edior commands
 
 

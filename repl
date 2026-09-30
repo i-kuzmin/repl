@@ -7,6 +7,8 @@ require 'pty'
 require 'socket'
 require 'strscan'
 require 'rbconfig'
+require 'digest'
+require 'shellwords'
 
 
 module OS
@@ -73,6 +75,15 @@ class BasicLogger < Logger
   # itself.
   def redirect target
     reopen(%w[stdout -].include?(target) ? $stdout : target)
+    @logfile = target
+  end
+
+  def logfile
+    @logfile || 'stdout'
+  end
+
+  def level_name
+    SEV_LABEL[level]
   end
 end
 
@@ -85,7 +96,8 @@ class Server
   def initialize kernel,
  		input: $stdin,
         output: $stdout,
-        hide_cursor: true
+        hide_cursor: true,
+        caching: true
 
     @socket = "/tmp/REPL.#{Process.pid}.sock"
     File.unlink(@socket) if File.exist? @socket
@@ -95,6 +107,7 @@ class Server
     @input = input
     @output = output
     @cache = {}
+    @caching = caching
     @hide_cursor = hide_cursor
     setup_signal_handlers
   end
@@ -134,8 +147,10 @@ class Server
       handle_show_request(client, $1.nil? ? $1 : $1.to_i)
     when /^%stop$/
       handle_stop_request client
-    when /^%set:(\w+)=(.+)$/
+    when /^%set:(\w+)=(.*)$/
       handle_set_request client, $1, $2
+    when /^%get:([\w,]*)$/
+      handle_get_request client, $1.split(',')
     else
       raise "Unknown request '#{l}'"
     end
@@ -208,8 +223,7 @@ class Server
   # '#==' terminator) can ask for the whole of it again with `show`.
   def handle_send_request client, input
     answer = feed(client, input)
-    @cache[client.id] = answer
-    @last_id = client.id
+    remember client.id, answer
     client.send_response 'Ok', answer
   end
 
@@ -219,9 +233,29 @@ class Server
 
     Log.info "#{client}: posting to kernel"
     response = feed client, input
-    @cache[client.id] = response
-    @last_id = client.id
-    Log.info "#{client}: caching response #{response.size} bytes"
+    remember client.id, response
+  end
+
+  # Without caching only the last answer is kept.
+  def remember id, answer
+    @cache.clear unless @caching
+    Log.info "R#{id}: caching response #{answer.size} bytes"
+    @cache[id] = answer
+    @last_id = id
+  end
+
+  def caching= on
+    @caching = on
+    @cache.select! { |id, _| id == @last_id } unless on
+  end
+
+  FLAGS = {
+    'on' => true, 'true' => true, 'yes' => true, '1' => true,
+    'off' => false, 'false' => false, 'no' => false, '0' => false,
+  }.freeze
+
+  def self.flag value
+    FLAGS.fetch(value.downcase) { raise "'#{value}' is not on/off" }
   end
 
   def handle_stop_request client
@@ -230,7 +264,13 @@ class Server
     client.send_response 'Ok'
   end
 
+  # An empty value resets the key to its default.
+  DEFAULTS = {
+    'loglevel' => 'WARN', 'output' => 'stdout', 'logfile' => 'stdout', 'caching' => 'on',
+  }.freeze
+
   def handle_set_request client, key, value
+    value = DEFAULTS.fetch(key, value) if value.empty?
     case key
     when 'loglevel'
       Log.set_level value
@@ -238,10 +278,34 @@ class Server
       @kernel.output = value
     when 'logfile'
       Log.redirect value
+    when 'caching'
+      self.caching = Server.flag value
+    when 'name'
+      @kernel.name = value
     else
       raise "Unknown key '#{key}'"
     end
     client.send_response 'Ok'
+  end
+
+  def values
+    {
+      'name' => @kernel.name,
+      'cmd' => Shellwords.join(@kernel.cmd),
+      'caching' => @caching ? 'on' : 'off',
+      'output' => @kernel.output_name,
+      'loglevel' => Log.level_name,
+      'logfile' => Log.logfile,
+    }
+  end
+
+  # Answers with one 'key=value' line per key, all of them when none is given.
+  def handle_get_request client, keys
+    all = values
+    keys = all.keys if keys.empty?
+    unknown = keys - all.keys
+    raise "Unknown key(s) '#{unknown.join(', ')}'" unless unknown.empty?
+    client.send_response 'Ok', keys.map { |k| "#{k}=#{all[k]}\n" }.join
   end
 
   def handle_show_request client, id
@@ -343,8 +407,36 @@ class Server::Socket
         filter {|socket| socket.alive }
   end
 
+  # REPL_SOCKET if set, otherwise the only running kernel.
   def self.default
+    ref = ENV['REPL_SOCKET']
+    return resolve(ref) unless ref.nil? || ref.empty?
     (l = self.list).size == 1 ? l.first : nil
+  end
+
+  MIN_PREFIX = 4
+
+  def digest
+    @digest ||= Digest::MD5.hexdigest(@path)
+  end
+
+  # Shortest digest prefix that tells this socket apart from the others.
+  def prefix sockets
+    others = sockets.reject { |s| s.path == @path }
+    n = (MIN_PREFIX..digest.size).find do |i|
+      others.none? { |s| s.digest.start_with?(digest[0, i]) }
+    end
+    digest[0, n || digest.size]
+  end
+
+  # A socket path, or an unambiguous prefix of its digest.
+  def self.resolve ref, sockets = list
+    return new(ref) if ref.include?('/')
+    raise "Socket hash '#{ref}' is too short (min #{MIN_PREFIX})" if ref.size < MIN_PREFIX
+    found = sockets.select { |s| s.digest.start_with?(ref.downcase) }
+    raise "No kernel matches '#{ref}'" if found.empty?
+    raise "Socket hash '#{ref}' is ambiguous" if found.size > 1
+    found.first
   end
 
   attr_reader :path, :pid
@@ -478,10 +570,12 @@ class Kernel
   BANNER_WAIT = 10
 
   def initialize cmd,
+        name: nil,
         prompt: nil,
         output: $stdout,
         silent: false
     @cmd = cmd
+    @name = name.to_s
     @silent = silent
     @prompt = prompt
     self.output = output
@@ -501,9 +595,10 @@ class Kernel
     @output.close if @owns_output && @output && !@output.closed?
     @owns_output = opens_file
     @output = stream
+    @output_name = target.is_a?(String) ? target : (target == $stdout ? 'stdout' : target.inspect)
   end
 
-  attr_reader :output
+  attr_reader :output, :output_name
 
   def self.resolve_output path
     return $stdout if %w[stdout -].include? path
@@ -732,7 +827,8 @@ class Kernel
     recive_response
   end
 
-  attr_reader :pid, :prompt
+  attr_reader :pid, :prompt, :cmd
+  attr_accessor :name
 end
 
 # The buffer as `notebook` sees it: some code, and after it output blocks
@@ -901,6 +997,8 @@ class Client
   def initialize \
         socket: nil,
         echo: false,
+        timeout: nil,
+        interruptible: true,
  		input: $stdin,
         output: $stdout
 
@@ -911,8 +1009,9 @@ class Client
 	@input = input
 	@output = output
     @echo = echo
+    @timeout = timeout
 
-    setup_signal_handlers
+    setup_signal_handlers if interruptible
 
     Log.info "Client initialized (#{socket})"
   end
@@ -944,11 +1043,28 @@ class Client
 
   def set_request val
     raise "ERR: Value to set is required" if val.nil?
-    raise "ERR: '#{val}' has wrong format" unless /\A(\w+)=(.+)\z/.match val
+    raise "ERR: '#{val}' has wrong format" unless /\A(\w+)=(.*)\z/.match val
     request do
       Log.info "Sending set #{val}"
       @socket.puts "%set:#{$1}=#{$2}"
     end
+  end
+
+  def get_request *keys
+    request do
+      Log.info "Request get #{keys.join(',')}"
+      @socket.puts "%get:#{keys.join(',')}"
+    end
+  end
+
+  # The values as a hash, nil when the server fails or doesn't answer in time.
+  def values *keys
+    status, data, _id = exchange { @socket.puts "%get:#{keys.join(',')}" }
+    return nil unless status == 'Ok'
+    data.to_s.lines.to_h { |l| l.chomp.split('=', 2) }
+  rescue => e
+    Log.info "Can't get #{keys.join(',')}: #{e.message}"
+    nil
   end
 
   def show_request id = nil
@@ -987,19 +1103,17 @@ class Client
   end
 
   def self.new_from_args argv, method
-    options = {
-      socket: Server::Socket::default
-    }
+    options = {}
 
     parser = OptionParser.new do |o|
       Log.logging_options options, o
-      o.on('--socket PATH') do |v|
-        Log.raise "ERR: Server is not running at #{v}" \
-          unless (options[:socket] = Server::Socket.new(v)).alive
-      end
+      o.on('--socket PATH|HASH') { |v| options[:socket] = Server::Socket.resolve(v) }
       o.on('-e', '--echo') { options[:echo] = true }
     end
     args = parser.order(argv)
+    options[:socket] ||= Server::Socket.default
+    Log.raise "ERR: Server is not running at #{options[:socket]}" \
+      if options[:socket] && !options[:socket].alive
     Log.info "Client.options: #{options}, args:#{args}"
     Client.new(**options).send(method, *args)
   end
@@ -1034,6 +1148,10 @@ class Client
   # The answer carries the id of the request that produced it: the server keeps
   # it under that id, so it can be asked for again with `show ID`.
   def read_response
+    # The server serves one request at a time, so a busy one keeps us waiting.
+    if @timeout && IO.select([@socket], nil, nil, @timeout).nil?
+      raise "No response within #{@timeout}s"
+    end
     resp = @socket.gets
     Log.raise "Failed get response" if resp.nil?
 
@@ -1063,12 +1181,22 @@ class CommandLineInterface
     repl post [options]                       send a command, expect no answer
     repl stop [options]                       stop the kernel
     repl int, interrupt [options]             interrupt the running command
-    repl list, ls                             list running kernels
+    repl list, ls [-n]                        list running kernels (hash, socket, name, cmd);
+                                              -n: hash and socket only, don't query kernels
     repl show [id]                            show output for id (last if id not defined)
-    repl set [options]                        set kernel/session options
+    repl set [options] KEY=VALUE              set kernel/session options
+    repl get [options] [KEY...]               print 'key=value' lines (all if no KEY)
+
+  common options:
+    --socket PATH|HASH    kernel socket, or an unambiguous prefix (4+ chars)
+                           of its hash as shown by `ls`; defaults to
+                           REPL_SOCKET, then to the only running kernel
 
   kernel options:
     --prompt REGEX        regex matching the kernel's prompt
+    --name NAME           kernel name shown by `ls` (default: empty)
+    --[no-]caching        keep every answer for `show ID`, otherwise
+                           only the last one (default: on)
     --output PATH         kernel echoes its raw output while a
                            client is connected ('stdout'/'-', the default,
                            or any file path)
@@ -1081,12 +1209,22 @@ class CommandLineInterface
                            path); available on every command, also settable
                            via REPL_LOGFILE (REPL_LOGLEVEL sets the level)
 
-  set options (KEY=VALUE):
+  set options (KEY=VALUE, an empty VALUE resets KEY to its default):
     loglevel=LEVEL         change logging verbosity (DEBUG/INFO/WARN/FATAL)
     output=PATH             redirect the kernel's output ('stdout'/'-' to
                            restore standard output, or any file path)
     logfile=PATH            redirect the log output ('stdout'/'-' to
                            restore standard output, or any file path)
+    caching=on|off          keep every answer, or only the last one
+    name=NAME               rename the kernel
+
+  get keys:
+    name                   kernel name
+    cmd                    command the kernel was started with
+    caching                output caching state (on/off)
+    output                 where the kernel's raw output goes
+    loglevel               logging verbosity
+    logfile                where log output goes
   TEXT
 
   def initialize(
@@ -1102,7 +1240,7 @@ class CommandLineInterface
     when 'version'
       cmd_version
     when 'list', 'ls'
-      cmd_list
+      cmd_list argv
     when 'show'
       cmd_show argv
     when 'kernel'
@@ -1119,6 +1257,8 @@ class CommandLineInterface
       cmd_post argv
     when 'set'
       cmd_set argv
+    when 'get'
+      cmd_get argv
     when nil, 'help', '--help', '-h'
       @out.puts(USAGE)
       0
@@ -1140,6 +1280,8 @@ class CommandLineInterface
     parser = OptionParser.new do |o|
       Log.logging_options options, o
       o.on('--prompt REGEX') { |v| options[:prompt] = Regexp.new(v) }
+      o.on('--name NAME') { |v| options[:name] = v }
+      o.on('--[no-]caching') { |v| options[:caching] = v }
       o.on('--output PATH') { |v| options[:output] = v }
       o.on('-h', '--help') { options[:help] = true }
       o.on('-c', '--cursor') { options[:hide_cursor] = false }
@@ -1158,15 +1300,29 @@ class CommandLineInterface
       Process.daemon(true)
     end
 
-    server_options = options.slice(:hide_cursor)
-    kernel_options = options.slice(:prompt, :output)
+    server_options = options.slice(:hide_cursor, :caching)
+    kernel_options = options.slice(:prompt, :output, :name)
 
     kernel = Kernel.new(cmd, **kernel_options)
     kernel.start ? server = Server.new(kernel, **server_options).run : -1
   end
 
-  def cmd_list
-    puts Server::Socket::list
+  # A kernel busy with a command can't answer, its name and cmd show as '?'.
+  def cmd_list argv
+    sockets_only = false
+    OptionParser.new { |o| o.on('-n') { sockets_only = true } }.parse(argv)
+    sockets = Server::Socket.list
+    rows = sockets.map do |socket|
+      row = [socket.prefix(sockets), socket.to_s]
+      next row if sockets_only
+      info = Client.new(socket: socket, timeout: 0.5, interruptible: false).
+        values('name', 'cmd') || {}
+      row + [info.fetch('name', '?'), info.fetch('cmd', '?')]
+    end
+    widths = rows.transpose.map { |column| column.map(&:size).max }
+    rows.each do |row|
+      @out.puts row.zip(widths).map { |v, w| v.ljust(w) }.join('  ').rstrip
+    end
     0
   end
 
@@ -1176,13 +1332,13 @@ class CommandLineInterface
   end
 
   def cmd_interrupt argv
-    options = {
-      socket: Server::Socket::default,
-    }
+    options = {}
     OptionParser.new do |o|
       Log.logging_options options, o
-      o.on('--socket PATH') {|v| options[:socket] = Server::Socket.new(v)}
+      o.on('--socket PATH|HASH') { |v| options[:socket] = Server::Socket.resolve(v) }
     end.order(argv)
+    options[:socket] ||= Server::Socket.default
+    raise "Can't determine socket" unless options[:socket]
     Log.info "Interrupting #{options[:socket]}..."
     if options[:socket].alive
       Process.kill('INT', options[:socket].pid)
@@ -1214,6 +1370,10 @@ class CommandLineInterface
 
   def cmd_set argv
     Client.new_from_args(argv, :set_request)
+  end
+
+  def cmd_get argv
+    Client.new_from_args(argv, :get_request)
   end
 end
 
