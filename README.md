@@ -1,44 +1,46 @@
 # Functional description
 
 
-Command line utility which wraps Run Execute Print Loop (REPL) in the way that it can be communicated by sending commands
-and receiving responses through some channel (e.g. UNIX socket).
+Command line utility which wraps Run Execute Print Loop (REPL) in the way that
+it can be communicated by sending commands and receiving responses through some
+channel (e.g. UNIX socket).
 
-It is important that backend REPL process was persistent. i.e. different client requests just changes server state, but
-doesn't re-create the instacne
+It is important that backend REPL process was persistent. i.e. different client
+requests just changes server state, but doesn't re-create the instacne
 
-usual flow is the following:
-client sends message, server executes it in REPL and returns output as a reply. (client usually ends it's live at this
-point)
+usual flow is the following: client sends message, server executes it in REPL
+and returns output as a reply. (client usually ends it's live at this point)
 
 server should communicate with clients through unix socket
 
 ## Special functions: notebook
 
 
-- repl notebook - special send version, with input preprocessing and output crafting.
-  It also implies command echoing in the output. (the idea is to bein able feed the command to
-  the tool, and replace it with newly crafted output from repl if command implies it)
+- repl notebook - special send version, with input preprocessing and output
+  crafting. It also implies command echoing in the output. (the idea is to bein
+  able feed the command to the tool, and replace it with newly crafted output from
+  repl if command implies it)
 
-- if input includes markdown code section begin, it should be cut-off (with any preceeding lines
-  before feeding to repl "```bash\nrepl_cmd" should result in "repl_cmd" for the backend programm
-  "repl_cmd\n```" should result in "repl_cmd" for the backend programm
+- if input includes markdown code section begin, it should be cut-off (with any
+  preceeding lines before feeding to repl "```bash\nrepl_cmd" should result in
+  "repl_cmd" for the backend programm "repl_cmd\n```" should result in "repl_cmd"
+  for the backend programm
 
-- if input contains special lines "#=>\n" and/or "#==\n" text between shold be removed,
-  and repl output of the command should be placed here. 
-  NB! if '#==' line is ommited, first line without comment is considered end of output block
+- if input contains special lines "#=>\n" and/or "#==\n" text between shold be
+  removed, and repl output of the command should be placed here.  NB! if '#=='
+  line is ommited, first line without comment is considered end of output block
 
 - the terminator of a freshly answered block carries the id of the answer,
   '#==[45]'; `repl show 45` hands out the whole of that answer again
 
-- if there are multiple '#=>' it means command should be splitted before feeding to repl backend
+- if there are multiple '#=>' it means command should be splitted before feeding
+  to repl backend
 
 - if there are no '#=>' lines the whole buffer is one block
 
 - each block shows the output of all its commands, joined in one block of text
 
 - each output line is prepended by '# 'c haracter
-
 
 
 # Usage examples
@@ -141,9 +143,4 @@ $ export REPL_SOCKET=3f2a
 
 # Vim plugin and specific edior commands
 
-
-# TODO
-- convert usage examples to unit tests
-- consider changing client-server protocol to json
-
-# tw=80
+# vim: tw=80
