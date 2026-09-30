@@ -40,7 +40,7 @@ describe 'README usage examples' do
   end
 
   def repl(*args, stdin_data: '')
-    Open3.capture3(REPL_BIN, *args, '--socket', @socket, stdin_data: stdin_data)
+    Open3.capture3(REPL_BIN, '--socket', @socket, *args, stdin_data: stdin_data)
   end
 
   # The id a terminator carries is the number of the request that answered the
@@ -62,7 +62,7 @@ describe 'README usage examples' do
 
   it 'post: returns immediately even for a slow command ($? == 0)' do
     out, _err, status = Open3.capture3(
-      'timeout', '1', REPL_BIN, 'post', '--socket', @socket,
+      'timeout', '1', REPL_BIN, '--socket', @socket, 'post',
       stdin_data: "(sleep 5 && echo \"done\")\n"
     )
     _(status.success?).must_equal true
@@ -71,7 +71,7 @@ describe 'README usage examples' do
 
   it 'send: times out on a slow command ($? != 0)' do
     _out, _err, status = Open3.capture3(
-      'timeout', '1', REPL_BIN, 'send', '--socket', @socket,
+      'timeout', '1', REPL_BIN, '--socket', @socket, 'send',
       stdin_data: "sleep 5\n"
     )
     _(status.success?).must_equal false
@@ -79,7 +79,7 @@ describe 'README usage examples' do
 
   it 'send: returns the command output within the timeout' do
     out, _err, status = Open3.capture3(
-      'timeout', '1', REPL_BIN, 'send', '--socket', @socket,
+      'timeout', '1', REPL_BIN, '--socket', @socket, 'send',
       stdin_data: "echo Ok\n"
     )
     _(status.success?).must_equal true
@@ -132,7 +132,7 @@ describe 'README usage examples' do
     _(id).wont_be_nil
 
     shown, _err, status = Open3.capture3(
-      REPL_BIN, 'show', '--socket', @socket, id, stdin_data: ''
+      REPL_BIN, '--socket', @socket, 'show', id, stdin_data: ''
     )
     _(status.success?).must_equal true
     _(shown).must_equal "one\n"
@@ -140,7 +140,7 @@ describe 'README usage examples' do
 
   it 'show: fails on an id nothing was stored under' do
     _out, _err, status = Open3.capture3(
-      REPL_BIN, 'show', '--socket', @socket, '999999', stdin_data: ''
+      REPL_BIN, '--socket', @socket, 'show', '999999', stdin_data: ''
     )
     _(status.success?).must_equal false
   end
@@ -157,12 +157,8 @@ describe 'README usage examples' do
     _(File.exist?(@socket)).must_equal false
   end
 
-  # `set` takes its key=value as a trailing positional argument, so --socket
-  # has to come before it (OptionParser stops parsing at the first
-  # non-option argument), unlike the other subcommands which take no
-  # positional arguments of their own.
   def set(value)
-    Open3.capture3(REPL_BIN, 'set', '--socket', @socket, value, stdin_data: '')
+    Open3.capture3(REPL_BIN, '--socket', @socket, 'set', value, stdin_data: '')
   end
 
   it 'set output=PATH: redirects the kernel raw output to a file, and back to stdout' do
@@ -236,7 +232,7 @@ describe 'kernel --output PATH' do
 
   it 'echoes the kernel raw output to the given file from startup' do
     out, _err, status = Open3.capture3(
-      REPL_BIN, 'send', '--socket', @socket, stdin_data: "echo direct\n"
+      REPL_BIN, '--socket', @socket, 'send', stdin_data: "echo direct\n"
     )
     _(status.success?).must_equal true
     _(out).must_equal "direct\n"
@@ -252,7 +248,7 @@ describe 'client without a server' do
   # until the stack ran out.
   it 'fails once with a message instead of recursing' do
     out, err, status = Open3.capture3(
-      REPL_BIN, 'send', '--socket', '/tmp/REPL.0.sock', stdin_data: "echo hi\n"
+      REPL_BIN, '--socket', '/tmp/REPL.0.sock', 'send', stdin_data: "echo hi\n"
     )
     _(status.success?).must_equal false
     _((out + err).lines.size).must_be :<=, 2

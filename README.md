@@ -131,7 +131,7 @@ main  4242  on
 
 ```sh
 # a socket can be given by an unambiguous hash prefix (2+ chars), or via env
-$ echo 'echo hi' | repl send --socket 3f2a
+$ echo 'echo hi' | repl --socket 3f2a send
 hi
 $ export REPL_SOCKET=3f2a
 ```

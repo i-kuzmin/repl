@@ -28,12 +28,12 @@ function! repl#executable() abort
 endfunction
 
 function! s:command(subcommand) abort
-  let l:parts = [repl#executable(), a:subcommand]
+  let l:parts = [repl#executable()]
   let l:socket = get(b:, 'repl_socket', get(g:, 'repl_socket', ''))
   if !empty(l:socket)
     let l:parts += ['--socket', shellescape(l:socket)]
   endif
-  return join(l:parts, ' ')
+  return join(l:parts + [a:subcommand], ' ')
 endfunction
 
 function! s:error(message) abort

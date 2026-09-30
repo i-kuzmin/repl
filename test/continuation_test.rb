@@ -123,7 +123,7 @@ describe 'multi-line commands over the socket' do
   end
 
   def send_stdin(data)
-    Open3.capture3(REPL_BIN, 'send', '--socket', @socket, stdin_data: data)
+    Open3.capture3(REPL_BIN, '--socket', @socket, 'send', stdin_data: data)
   end
 
   it 'answers a multi-line block with the output of the block' do

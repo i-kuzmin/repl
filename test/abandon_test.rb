@@ -152,7 +152,7 @@ describe 'abandoning over the socket' do
 
   def send_stdin(data)
     Timeout.timeout(30) do
-      Open3.capture3(REPL_BIN, 'send', '--socket', @socket, stdin_data: data)
+      Open3.capture3(REPL_BIN, '--socket', @socket, 'send', stdin_data: data)
     end
   end
 

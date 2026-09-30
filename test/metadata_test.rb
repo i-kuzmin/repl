@@ -32,7 +32,7 @@ describe 'kernel metadata and caching' do
   end
 
   def repl(command, *args, stdin_data: '')
-    Open3.capture3(METADATA_BIN, command, '--socket', @socket, *args,
+    Open3.capture3(METADATA_BIN, '--socket', @socket, command, *args,
                    stdin_data: stdin_data)
   end
 
@@ -182,7 +182,7 @@ describe 'kernel metadata and caching' do
 
     it '--socket: accepts a hash prefix instead of a path' do
       out, _err, status = Open3.capture3(
-        METADATA_BIN, 'send', '--socket', digest[0, 12], stdin_data: "echo by-hash\n"
+        METADATA_BIN, '--socket', digest[0, 12], 'send', stdin_data: "echo by-hash\n"
       )
       _(status.success?).must_equal true
       _(out).must_equal "by-hash\n"
@@ -190,10 +190,35 @@ describe 'kernel metadata and caching' do
 
     it '--socket: rejects a hash prefix shorter than 2 characters' do
       _out, err, status = Open3.capture3(
-        METADATA_BIN, 'send', '--socket', digest[0, 1], stdin_data: "echo x\n"
+        METADATA_BIN, '--socket', digest[0, 1], 'send', stdin_data: "echo x\n"
       )
       _(status.success?).must_equal false
       _(err).must_match(/too short/)
+    end
+
+    it 'general options: accepted before the command only' do
+      out, _err, status = Open3.capture3(
+        METADATA_BIN, '-v', '--socket', @socket, 'get', 'name'
+      )
+      _(status.success?).must_equal true
+      _(out).must_include "name=\n"
+
+      _out, _err, status = Open3.capture3(
+        METADATA_BIN, 'send', '--socket', @socket, stdin_data: "echo x\n"
+      )
+      _(status.success?).must_equal false
+    end
+
+    it 'command options: accepted after the command only' do
+      _out, _err, status = Open3.capture3(METADATA_BIN, '-o', 'name', 'ls')
+      _(status.success?).must_equal false
+      _(Open3.capture3(METADATA_BIN, 'ls', '-o', 'name')[2].success?).must_equal true
+    end
+
+    it 'kernel: rejects --socket' do
+      _out, err, status = Open3.capture3(METADATA_BIN, '--socket', @socket, 'kernel', 'bash')
+      _(status.success?).must_equal false
+      _(err).must_match(/doesn't apply/)
     end
 
     it 'REPL_SOCKET: selects the kernel by path or hash' do

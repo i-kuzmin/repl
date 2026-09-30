@@ -131,7 +131,8 @@ executable, then the copy sitting next to the plugin, then `repl` from $PATH. >
 <
                                                                *g:repl_socket*
                                                                *b:repl_socket*
-The kernel socket, passed as `--socket`. When empty `repl` falls back to
+The kernel socket (a path, or a hash prefix as shown by `repl ls`), passed
+as `--socket`. When empty `repl` falls back to
 $REPL_SOCKET, or to the only running server. `b:repl_socket` wins over
 `g:repl_socket`, so different buffers can talk to different kernels. >
 

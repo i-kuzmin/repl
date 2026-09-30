@@ -1,14 +1,14 @@
 #!/usr/bin/env ruby
 
+require 'digest'
 require 'io/console'
 require 'logger'
 require 'optparse'
 require 'pty'
+require 'rbconfig'
+require 'shellwords'
 require 'socket'
 require 'strscan'
-require 'rbconfig'
-require 'digest'
-require 'shellwords'
 
 
 module OS
@@ -112,7 +112,6 @@ class Server
     setup_signal_handlers
   end
 
-
   def run
 	Log.info "Server started"
     cursor OFF
@@ -163,7 +162,6 @@ class Server
     client.close
     Log.info "#{client}: done"
   end
-
 
   # Commands are fed one line at a time, so that each answer belongs to a known
   # command instead of having to be split out of one merged response. A line
@@ -336,7 +334,6 @@ class Server
     cursor OFF
     trap('TSTP') { handle_tstp_signal }
   end
-
 
   CURSOR_OFF = "\e[?25l"
   CURSOR_ON = "\e[?25h"
@@ -1105,18 +1102,13 @@ class Client
     -1
   end
 
-  def self.new_from_args argv, method
-    options = {}
+  def self.new_from_args argv, method, socket
+    options = { socket: socket }
 
     parser = OptionParser.new do |o|
-      Log.logging_options options, o
-      o.on('--socket PATH|HASH') { |v| options[:socket] = Server::Socket.resolve(v) }
       o.on('-e', '--echo') { options[:echo] = true }
     end
     args = parser.order(argv)
-    options[:socket] ||= Server::Socket.default
-    Log.raise "ERR: Server is not running at #{options[:socket]}" \
-      if options[:socket] && !options[:socket].alive
     Log.info "Client.options: #{options}, args:#{args}"
     Client.new(**options).send(method, *args)
   end
@@ -1176,7 +1168,8 @@ end
 
 class CommandLineInterface
   USAGE = <<~TEXT.freeze
-  Usage:
+  Usage: repl [general options] COMMAND [command options]
+
     repl kernel [options] COMMAND [ARGS...]   start a REPL server
     repl send [options]                       send a command (stdin if no TEXT)
     repl notebook [options]                   send a buffer, echo it back with
@@ -1189,10 +1182,14 @@ class CommandLineInterface
     repl set [options] KEY=VALUE              set kernel/session options
     repl get [options] [KEY...]               print 'key=value' lines (all if no KEY)
 
-  common options:
+  general options (before COMMAND):
     --socket PATH|HASH    kernel socket, or an unambiguous prefix (2+ chars)
                            of its hash as shown by `ls`; defaults to
                            REPL_SOCKET, then to the only running kernel
+    -v / -s               raise / lower log verbosity
+    --logfile PATH        redirect log output ('stdout'/'-' or any file
+                           path), also settable via REPL_LOGFILE
+                           (REPL_LOGLEVEL sets the level)
 
   kernel options:
     --prompt REGEX        regex matching the kernel's prompt
@@ -1206,10 +1203,6 @@ class CommandLineInterface
     -d, --daemon          detach and run in the background; implies
                            -c and defaults --output/--logfile to discard
                            (/dev/null) unless set explicitly
-    -v / -s               raise / lower log verbosity
-    --logfile PATH         redirect log output ('stdout'/'-' or any file
-                           path); available on every command, also settable
-                           via REPL_LOGFILE (REPL_LOGLEVEL sets the level)
 
   ls options:
     -o FIELD,...          columns to print (default: hash,socket,name,cmd):
@@ -1245,6 +1238,7 @@ class CommandLineInterface
   end
 
   def invoke argv
+    argv = general_options argv
     case (command = argv.shift)
     when 'version'
       cmd_version
@@ -1282,12 +1276,28 @@ class CommandLineInterface
 
   private
 
+  # General options go before the command, command options after it.
+  def general_options argv
+    @options = {}
+    OptionParser.new do |o|
+      Log.logging_options @options, o
+      o.on('--socket PATH|HASH') { |v| @options[:socket] = v }
+      o.on('-h', '--help') { @options[:help] = true }
+    end.order(argv).then { |rest| @options[:help] ? ['help'] : rest }
+  end
+
+  # The kernel commands talk to: --socket, REPL_SOCKET, or the only running one.
+  def socket
+    s = @options[:socket] ? Server::Socket.resolve(@options[:socket]) : Server::Socket.default
+    raise "Can't determine socket" unless s
+    raise "Server is not running at #{s}" unless s.alive
+    s
+  end
+
   def cmd_kernel argv
+    raise "--socket doesn't apply to kernel" if @options[:socket]
     options = {}
-    #  prompt: /^.+\$ $/,
-    #}
     parser = OptionParser.new do |o|
-      Log.logging_options options, o
       o.on('--prompt REGEX') { |v| options[:prompt] = Regexp.new(v) }
       o.on('--name NAME') { |v| options[:name] = v }
       o.on('--[no-]caching') { |v| options[:caching] = v }
@@ -1305,7 +1315,7 @@ class CommandLineInterface
       # discard whatever wasn't explicitly pointed elsewhere.
       options[:hide_cursor] = false
       options[:output] ||= File::NULL
-      Log.redirect(File::NULL) unless options[:logfile]
+      Log.redirect(File::NULL) unless @options[:logfile]
       Process.daemon(true)
     end
 
@@ -1368,48 +1378,40 @@ class CommandLineInterface
   end
 
   def cmd_interrupt argv
-    options = {}
-    OptionParser.new do |o|
-      Log.logging_options options, o
-      o.on('--socket PATH|HASH') { |v| options[:socket] = Server::Socket.resolve(v) }
-    end.order(argv)
-    options[:socket] ||= Server::Socket.default
-    raise "Can't determine socket" unless options[:socket]
-    Log.info "Interrupting #{options[:socket]}..."
-    if options[:socket].alive
-      Process.kill('INT', options[:socket].pid)
-      Log.info "Signal sent to #{options[:socket].pid}"
-    else
-      Log.info "Kernel is not alive"
-    end
+    OptionParser.new.parse(argv)
+    target = socket
+    Log.info "Interrupting #{target}..."
+    Process.kill('INT', target.pid)
+    Log.info "Signal sent to #{target.pid}"
+    0
   end
 
   def cmd_send argv
-    Client.new_from_args(argv, :send_request)
+    Client.new_from_args(argv, :send_request, socket)
   end
 
   def cmd_notebook argv
-    Client.new_from_args(argv, :notebook_request)
+    Client.new_from_args(argv, :notebook_request, socket)
   end
 
   def cmd_post argv
-    Client.new_from_args(argv, :post_request)
+    Client.new_from_args(argv, :post_request, socket)
   end
 
   def cmd_stop argv
-    Client.new_from_args(argv, :stop_request)
+    Client.new_from_args(argv, :stop_request, socket)
   end
 
   def cmd_show argv
-    Client.new_from_args(argv, :show_request)
+    Client.new_from_args(argv, :show_request, socket)
   end
 
   def cmd_set argv
-    Client.new_from_args(argv, :set_request)
+    Client.new_from_args(argv, :set_request, socket)
   end
 
   def cmd_get argv
-    Client.new_from_args(argv, :get_request)
+    Client.new_from_args(argv, :get_request, socket)
   end
 end
 
