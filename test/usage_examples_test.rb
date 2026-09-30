@@ -151,6 +151,25 @@ describe 'README usage examples' do
     _(out).must_equal "one\ntwo\n"
   end
 
+  it 'send -- TEXT: sends the arguments instead of stdin' do
+    out, _err, status = repl('send', '--', 'echo', 'hello', 'world', stdin_data: "echo stdin\n")
+    _(status.success?).must_equal true
+    _(out).must_equal "hello world\n"
+  end
+
+  it 'post -- TEXT: sends the arguments without waiting for the answer' do
+    _out, _err, status = repl('post', '--', 'A=5')
+    _(status.success?).must_equal true
+    out, _err, _status = repl('send', '--', 'echo', '$A')
+    _(out).must_equal "5\n"
+  end
+
+  it 'send: rejects text given without --' do
+    _out, err, status = repl('send', 'echo', 'hi')
+    _(status.success?).must_equal false
+    _(err).must_match(/after '--'/)
+  end
+
   it 'stop: stops the kernel ($? == 0)' do    _out, _err, status = repl('stop')
     _(status.success?).must_equal true
     Process.wait(@server_pid)

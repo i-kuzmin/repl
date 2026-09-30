@@ -1016,18 +1016,18 @@ class Client
     Log.info "Client initialized (#{socket})"
   end
 
-  def post_request
+  def post_request text = nil
     request do
-      data = @input.read
+      data = text || @input.read
       @socket.puts "%post:#{data.size}"
       @socket.write data
       Log.info "sent: #{data.size}"
     end
   end
 
-  def send_request
+  def send_request text = nil
     request do
-      data = @input.read
+      data = text || @input.read
       @socket.puts "%send:#{data.size}"
       @socket.write data
       Log.info "sent: #{data.size}"
@@ -1102,7 +1102,7 @@ class Client
     -1
   end
 
-  def self.new_from_args argv, method, socket
+  def self.new_from_args argv, method, socket, *extra
     options = { socket: socket }
 
     parser = OptionParser.new do |o|
@@ -1110,7 +1110,7 @@ class Client
     end
     args = parser.order(argv)
     Log.info "Client.options: #{options}, args:#{args}"
-    Client.new(**options).send(method, *args)
+    Client.new(**options).send(method, *args, *extra)
   end
 
   private
@@ -1172,8 +1172,8 @@ class CommandLineInterface
 
   Commands:
     kernel     start a REPL server around a command (default: bash)
-    send       send stdin to the kernel, print the answer
-    post       send stdin to the kernel, don't wait for the answer
+    send       send stdin (or text after '--') to the kernel, print the answer
+    post       like send, but don't wait for the answer
     notebook   send a buffer, echo it back with every '#=>' block filled in
     show       print a cached answer (the last one by default)
     get        print kernel settings as 'key=value' lines
@@ -1226,20 +1226,23 @@ class CommandLineInterface
         --output PATH         where the kernel echoes its raw output
                               ('stdout'/'-', the default, or a file path)
         -c, --cursor          keep the cursor visible
-        -d, --daemon          run in the background; implies -c and discards
+        -d, --daemon          run in the background once the kernel has
+                              started (startup errors are still printed);
+                              implies -c and discards
                               output and log unless --output/--logfile is set
         -h, --help            print this help
     TEXT
     'send' => <<~TEXT,
-      Usage: repl [general options] send < INPUT
+      Usage: repl [general options] send [-- TEXT...]
 
-      Sends INPUT to the kernel line by line and prints the answer.
+      Sends TEXT (or stdin, without '--') to the kernel line by line and
+      prints the answer.
     TEXT
     'post' => <<~TEXT,
-      Usage: repl [general options] post < INPUT
+      Usage: repl [general options] post [-- TEXT...]
 
-      Sends INPUT to the kernel and returns without waiting for the answer;
-      `show` prints it once the kernel is done.
+      Sends TEXT (or stdin, without '--') to the kernel and returns without
+      waiting for the answer; `show` prints it once the kernel is done.
     TEXT
     'notebook' => <<~TEXT,
       Usage: repl [general options] notebook < BUFFER
@@ -1403,14 +1406,47 @@ class CommandLineInterface
       options[:hide_cursor] = false
       options[:output] ||= File::NULL
       Log.redirect(File::NULL) unless @options[:logfile]
-      Process.daemon(true)
     end
 
     server_options = options.slice(:hide_cursor, :caching)
     kernel_options = options.slice(:prompt, :output, :name)
 
+    return daemonize { |ready| run_kernel cmd, kernel_options, server_options, &ready } \
+      if options[:daemon]
+    run_kernel cmd, kernel_options, server_options
+  end
+
+  def run_kernel cmd, kernel_options, server_options
     kernel = Kernel.new(cmd, **kernel_options)
-    kernel.start ? server = Server.new(kernel, **server_options).run : -1
+    return -1 unless kernel.start
+    server = Server.new(kernel, **server_options)
+    yield if block_given?
+    server.run
+  end
+
+  # Detaches only once the kernel is up and its socket accepts clients, so a
+  # failed start is still reported to the terminal it was started from.
+  def daemonize
+    rd, wr = IO.pipe
+    if (pid = fork)
+      wr.close
+      status = rd.read
+      rd.close
+      Process.wait pid
+      return 0 if status == 'ok'
+      raise(status.empty? ? 'Kernel terminated' : status)
+    end
+
+    rd.close
+    Process.daemon(true)
+    begin
+      yield -> { wr.write 'ok'; wr.close }
+    rescue Exception => e
+      wr.write e.message unless wr.closed?
+      raise
+    ensure
+      wr.close unless wr.closed?
+    end
   end
 
   LOCAL_FIELDS = %w[hash socket pid].freeze
@@ -1474,7 +1510,16 @@ class CommandLineInterface
   end
 
   def cmd_send argv
-    Client.new_from_args(argv, :send_request, socket)
+    text_request argv, :send_request
+  end
+
+  # Arguments after '--' are sent as one line instead of stdin.
+  def text_request argv, method
+    i = argv.index('--') || argv.size
+    options, words = argv[0...i], argv[(i + 1)..] || []
+    raise "text to send goes after '--'" if options.any? { |a| !a.start_with?('-') }
+    text = words.empty? ? nil : "#{words.join(' ')}\n"
+    Client.new_from_args(options, method, socket, text)
   end
 
   def cmd_notebook argv
@@ -1482,7 +1527,7 @@ class CommandLineInterface
   end
 
   def cmd_post argv
-    Client.new_from_args(argv, :post_request, socket)
+    text_request argv, :post_request
   end
 
   def cmd_stop argv

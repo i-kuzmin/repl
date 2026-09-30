@@ -56,6 +56,9 @@ $ echo "a=[1,2,3]" | repl send
 
 $ echo 'a[1]' | repl send
 => 2
+
+$ repl send -- 'a[1] + 1'
+=> 3
 ```
 
 ```sh
